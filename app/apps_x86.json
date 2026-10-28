@@ -558,6 +558,15 @@
       "uninstall": "curl -Ls https://github.com/batocera-unofficial-addons/batocera-unofficial-addons/raw/refs/heads/main/jellyfin-client/jellyfin-client_uninstall.sh | bash"
     },
     {
+      "name": "KytyPS5",
+      "description": "Experimental PS5 emulator - adds a PlayStation 5 system to EmulationStation.",
+      "categories": [
+        "Game Utilities"
+      ],
+      "install": "curl -L https://github.com/batocera-unofficial-addons/batocera-unofficial-addons/raw/refs/heads/main/kytyps5/kytyps5.sh | bash",
+      "uninstall": "curl -Ls https://github.com/batocera-unofficial-addons/batocera-unofficial-addons/raw/refs/heads/main/kytyps5/kytyps5_uninstall.sh | bash"
+    },
+    {
       "name": "Luanti",
       "description": "Voxel sandbox (Minecraft-like)",
       "categories": [
