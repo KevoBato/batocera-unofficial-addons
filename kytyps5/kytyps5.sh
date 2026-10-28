@@ -1,8 +1,11 @@
 #!/bin/bash
 # Installer for KytyPS5, an experimental PS5 emulator.
 # Installs the latest official Linux build to /userdata/system/add-ons/kytyps5
-# and adds a PlayStation 5 system to EmulationStation that launches it through
-# emulatorlauncher (Hotkey+Start exits). Games go in /userdata/roms/ps5.
+# and adds a PlayStation 5 system to EmulationStation (Hotkey+Start exits).
+# Games go in /userdata/roms/ps5.
+# Batocera 44 replaced configgen/emulatorlauncher with batocera-launch, which
+# finds emulators through Python entry points, so the installer reads the
+# Batocera version and installs the matching launcher.
 # Optional: KYTY_URL=<direct .tar.gz link> to install a specific build.
 
 # Variables
@@ -11,7 +14,8 @@ es_config_dir="/userdata/system/configs/emulationstation"
 rom_dir="/userdata/roms/ps5"
 batocera_conf="/userdata/system/batocera.conf"
 work_dir="/userdata/system/.kytyps5-install-tmp"
-user_site="/userdata/system/.local/lib/$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')/site-packages"
+# Python's per-user site-packages, as seen by EmulationStation (HOME=/userdata/system)
+user_site=$(HOME=/userdata/system python3 -c 'import site; print(site.getusersitepackages())')
 base_url="https://github.com/batocera-unofficial-addons/batocera-unofficial-addons/raw/main/kytyps5"
 bua_url="https://github.com/batocera-unofficial-addons/batocera-unofficial-addons/raw/main/app"
 releases_api="https://api.github.com/repos/KytyPS5/KytyPS5/releases?per_page=15"
@@ -36,8 +40,28 @@ if [ "$(uname -m)" != "x86_64" ]; then
     fail "KytyPS5 only has x86_64 builds. This machine is $(uname -m)."
 fi
 
+# Pick the launcher by Batocera version: 44 and later use batocera-launch,
+# 43 and earlier use configgen's emulatorlauncher.
+batocera_version=$(batocera-version 2>/dev/null)
+major=$(echo "$batocera_version" | grep -o '^[0-9]*')
+echo "Batocera version: ${batocera_version:-unknown}"
+[ -n "$major" ] || fail "Could not read the Batocera version."
+if [ "$major" -ge 44 ]; then
+    launcher="batocera-launch"
+    package="batocera_launch.emulator"
+else
+    launcher="emulatorlauncher"
+    package="configgen.generators"
+fi
+# Make sure that launcher is really there (early Batocera 44 test builds still
+# had configgen). -I keeps the per-user folders and the current directory out,
+# so only the system's own packages count.
+python3 -I -c "import $package" 2>/dev/null \
+    || fail "Batocera $major should have $launcher, but $package is missing. KytyPS5 was not installed."
+echo "Launcher: $launcher"
+
 # Ensure BUA Python hook is present (it lets emulatorlauncher find the generator)
-if [ ! -f "$user_site/usercustomize.py" ]; then
+if [ "$launcher" = "emulatorlauncher" ] && [ ! -f "$user_site/usercustomize.py" ]; then
     echo "Installing BUA Python hook..."
     mkdir -p "$user_site"
     wget -q --show-progress -O "$user_site/usercustomize.py" "$bua_url/usercustomize.py"
@@ -86,18 +110,35 @@ rm -rf "$work_dir"
 chmod +x "$install_dir/kyty_emulator"
 [ -f "$install_dir/launcher" ] && chmod +x "$install_dir/launcher"
 
-# Download generator and launch wrapper
-echo "Downloading generator..."
-mkdir -p "$install_dir/generator/kyty"
-wget -q --show-progress -O "$install_dir/generator/kyty/__init__.py" "$base_url/generator/kyty/__init__.py"
-wget -q --show-progress -O "$install_dir/generator/kyty/kytyGenerator.py" "$base_url/generator/kyty/kytyGenerator.py"
+# Download the launcher for this Batocera and the launch wrapper
+if [ "$launcher" = "batocera-launch" ]; then
+    # A package plus the dist-info that registers it as the "kyty" emulator
+    echo "Downloading batocera-launch emulator..."
+    plugin_dir="$user_site/batocera_launch_kyty"
+    dist_info="$user_site/batocera_launch_kyty-1.0.dist-info"
+    mkdir -p "$plugin_dir" "$dist_info"
+    wget -q --show-progress -O "$plugin_dir/__init__.py" "$base_url/launch/batocera_launch_kyty/__init__.py" \
+        || fail "Failed to download the batocera-launch emulator."
+    printf 'Metadata-Version: 2.1\nName: batocera-launch-kyty\nVersion: 1.0\n' > "$dist_info/METADATA"
+    printf '[batocera_launch.emulators]\nkyty = batocera_launch_kyty:Kyty\n' > "$dist_info/entry_points.txt"
+else
+    echo "Downloading generator..."
+    mkdir -p "$install_dir/generator/kyty"
+    wget -q --show-progress -O "$install_dir/generator/kyty/__init__.py" "$base_url/generator/kyty/__init__.py"
+    wget -q --show-progress -O "$install_dir/generator/kyty/kytyGenerator.py" "$base_url/generator/kyty/kytyGenerator.py"
+fi
 wget -q --show-progress -O "$install_dir/kyty.sh" "$base_url/extra/kyty.sh"
 chmod +x "$install_dir/kyty.sh"
 
 # Download and deploy ES system
 echo "Downloading ES config..."
-mkdir -p "$es_config_dir" "$rom_dir"
+mkdir -p "$es_config_dir"
+# The ROM folder may be a link to another drive, which can be unplugged
+[ -L "$rom_dir" ] || mkdir -p "$rom_dir"
 wget -q --show-progress -O "$es_config_dir/es_systems_ps5.cfg" "$base_url/extra/es_systems_ps5.cfg"
+if [ "$launcher" = "batocera-launch" ]; then
+    sed -i 's|<command>emulatorlauncher |<command>batocera-launch |' "$es_config_dir/es_systems_ps5.cfg"
+fi
 
 # Batocera has no default emulator for ps5, so set it (without this:
 # "emulator missing"). Bezels have no per-system menu for PS5, so turn them off.
