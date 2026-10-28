@@ -7,6 +7,7 @@ import threading
 import subprocess
 import pygame
 import json
+import math
 import base64
 import io
 import re
@@ -721,14 +722,33 @@ def load_fonts():
 
 FONT, FONT_SMALL, FONT_BIG = load_fonts()
 
+def load_console_fonts():
+    """Fonts for the console-style home and app grids. Unlike load_fonts(),
+    these scale with the screen, so tiles look the same at 720p and 4K."""
+    def sys_font(size: int, bold: bool = False):
+        return pygame.font.SysFont("DejaVu Sans", S(size), bold=bold)
+    return {
+        "hero": sys_font(30, bold=True),
+        "tile": sys_font(20, bold=True),
+        "body": sys_font(17),
+        "small": sys_font(14),
+        "monogram": sys_font(34, bold=True),
+        "monogram_big": sys_font(48, bold=True),
+    }
+
+UI_FONTS = load_console_fonts()
+
 # Batocera brand-inspired palette
-# Dark slate background, slate cards, cyan-blue accents
-BG = (12, 16, 20)
-CARD = (52, 64, 72)
-ACCENT = (0, 168, 224)
-FG = (235, 242, 247)
-MUTED = (153, 163, 173)
-SELECT = (0, 120, 180)
+# Near-black blue background, raised slate tiles, bright blue accent
+BG = (10, 13, 18)
+CARD = (27, 35, 45)
+CARD_HI = (36, 48, 62)
+ACCENT = (58, 166, 255)
+FG = (236, 242, 248)
+MUTED = (139, 152, 166)
+SELECT = (58, 166, 255)
+SUCCESS = (76, 205, 140)
+FOOTER_BG = (6, 8, 12)
 
 # ---------- Assets & Background ----------
 LOGO_SURF = None
@@ -1241,38 +1261,19 @@ def init_assets():
             if rb_surf is not None:
                 BUTTON_ICONS["RB"] = rb_surf
 
-    # Build a textured background once
+    # Build the background once: a dark blue vertical gradient with a soft
+    # accent glow in the top-left corner, like a console dashboard
     BACKGROUND_SURF = pygame.Surface((W, H)).convert()
-    BACKGROUND_SURF.fill(BG)
-    # Subtle vertical gradient
-    grad = pygame.Surface((W, H), pygame.SRCALPHA)
+    top, bottom = (16, 22, 32), BG
     for i in range(H):
-        a = int(40 * (i / H))
-        pygame.draw.line(grad, (0, 0, 0, a), (0, i), (W, i))
-    BACKGROUND_SURF.blit(grad, (0, 0))
-    # Vignette
-    vignette = pygame.Surface((W, H), pygame.SRCALPHA)
-    steps = 10
-    for s in range(steps):
-        r = int(max(W, H) * (0.6 + 0.4 * s / steps))
-        alpha = int(12 + 22 * s / steps)
-        pygame.draw.circle(vignette, (0, 0, 0, alpha), (W // 2, H // 2), r, width=3)
-    BACKGROUND_SURF.blit(vignette, (0, 0))
-    # Large logo background, centered and filling the whole screen
-    if LOGO_SURF is not None:
-        try:
-            # Scale-to-cover (fill), keep aspect ratio, center
-            cover_scale = max(W / LOGO_SURF.get_width(), H / LOGO_SURF.get_height())
-            new_w = max(1, int(LOGO_SURF.get_width() * cover_scale))
-            new_h = max(1, int(LOGO_SURF.get_height() * cover_scale))
-            wm = pygame.transform.smoothscale(LOGO_SURF, (new_w, new_h)).convert_alpha()
-            # Subtle dim so foreground text remains readable
-            tint = pygame.Surface(wm.get_size(), pygame.SRCALPHA)
-            tint.fill((0, 0, 0, 210))
-            wm.blit(tint, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
-            BACKGROUND_SURF.blit(wm, ((W - wm.get_width()) // 2, (H - wm.get_height()) // 2))
-        except Exception:
-            pass
+        f = i / max(1, H - 1)
+        color = tuple(int(top[c] + (bottom[c] - top[c]) * f) for c in range(3))
+        pygame.draw.line(BACKGROUND_SURF, color, (0, i), (W, i))
+    # Drawn small and scaled up, so the glow comes out smooth and cheap
+    glow_small = pygame.Surface((64, 36), pygame.SRCALPHA)
+    for r in range(28, 0, -1):
+        pygame.draw.circle(glow_small, (*ACCENT, int(5 * (28 - r) / 28) + 1), (8, 4), r)
+    BACKGROUND_SURF.blit(pygame.transform.smoothscale(glow_small, (W, H)), (0, 0))
 
 def draw_background(surf):
     if BACKGROUND_SURF is not None:
@@ -1288,12 +1289,13 @@ def draw_background(surf):
 def handle_resize(new_w: int, new_h: int):
     if not os.environ.get("BUA_WINDOWED"):
         return
-    global screen, W, H, UI_SCALE, FONT, FONT_SMALL, FONT_BIG
+    global screen, W, H, UI_SCALE, FONT, FONT_SMALL, FONT_BIG, UI_FONTS
     # Safe for windowed mode - does not affect KMS/DRM
     screen = pygame.display.set_mode((new_w, new_h), pygame.RESIZABLE)
     W, H = screen.get_size()
     UI_SCALE = max(1.0, min(W / 1280.0, H / 720.0))
     FONT, FONT_SMALL, FONT_BIG = load_fonts()
+    UI_FONTS = load_console_fonts()
     init_assets()
 
 # Controller support
@@ -1504,14 +1506,14 @@ def _scale_and_style_icon(icon: pygame.Surface, w: int, h: int) -> pygame.Surfac
     return scaled
 
 
-def draw_hints_line(surf, hint_text: str, font, color, pos):
+def draw_hints_line(surf, hint_text: str, font, color, pos, sep_text: str = " | "):
     """Draw a hint line, replacing A/B/X/Y with icons when available.
     Accepts separators '|' or ',' and segments like 'A=toggle'.
+    Returns the x where the line ends.
     """
     x, y = pos
     segments = [s.strip() for s in re.split(r"[|,]", hint_text) if s.strip()]
     # Layout tuning
-    sep_text = " | "
     icon_label_gap = 8  # px between icon/keycap and label
     segment_gap_extra = 4  # extra px after separator
     for i, seg in enumerate(segments):
@@ -1590,6 +1592,7 @@ def draw_hints_line(surf, hint_text: str, font, color, pos):
             sep_img = font.render(sep_text, True, color)
             surf.blit(sep_img, (x, y))
             x += sep_img.get_width() + segment_gap_extra
+    return x
 
 def draw_hints_block_right(surf, hint_text: str, font, color, pos, line_gap: int = 6):
     """Draw hints one per line, right-aligned to pos.x.
@@ -1673,6 +1676,284 @@ def draw_hints_block_right(surf, hint_text: str, font, color, pos, line_gap: int
 def draw_persistent_hints(surf) -> None:
     """Draw persistent hints - currently disabled as hints are shown inline on each screen."""
     pass
+
+# ------------------------------
+# Console-style UI components
+# ------------------------------
+
+# Monogram tile colours. Each app gets one from its name, so it keeps the
+# same colour everywhere.
+MONOGRAM_COLORS = [
+    (64, 116, 214), (136, 92, 214), (206, 92, 138), (214, 118, 62),
+    (40, 156, 136), (92, 148, 58), (190, 150, 36), (52, 138, 186),
+]
+
+# Home tile icons by English category name
+HOME_ICONS = {
+    "Games": "games",
+    "Windows Freeware": "windows",
+    "Game Utilities": "toolbox",
+    "System Utilities": "monitor",
+    "Developer Tools": "code",
+    "Docker Menu": "docker",
+}
+
+
+def fit_text(text: str, font, max_w: int) -> str:
+    """Shorten text with an ellipsis so it fits in max_w pixels."""
+    if font.size(text)[0] <= max_w:
+        return text
+    while text and font.size(text + "...")[0] > max_w:
+        text = text[:-1]
+    return text.rstrip() + "..."
+
+
+def monogram_color(name: str):
+    digest = hashlib.md5(name.encode("utf-8")).hexdigest()
+    return MONOGRAM_COLORS[int(digest, 16) % len(MONOGRAM_COLORS)]
+
+
+def monogram_text(name: str) -> str:
+    """Two letters for an app tile: initials, or the start of a one-word name."""
+    words = re.findall(r"[A-Za-z0-9]+", name)
+    if not words:
+        return name[:1].upper() or "?"
+    if len(words) == 1:
+        return words[0][:2].capitalize()
+    return (words[0][0] + words[1][0]).upper()
+
+
+def draw_tile(surf, rect, selected: bool = False, radius: int | None = None, fill=None):
+    """A raised rounded tile with a soft shadow; selected tiles are lighter and outlined."""
+    radius = S(14) if radius is None else radius
+    shadow = pygame.Surface(rect.size, pygame.SRCALPHA)
+    pygame.draw.rect(shadow, (0, 0, 0, 110), shadow.get_rect(), border_radius=radius)
+    surf.blit(shadow, rect.move(0, S(5)))
+    pygame.draw.rect(surf, fill or (CARD_HI if selected else CARD), rect, border_radius=radius)
+    if selected:
+        pygame.draw.rect(surf, ACCENT, rect, width=max(2, S(3)), border_radius=radius)
+
+
+def draw_monogram(surf, rect, name: str, font):
+    pygame.draw.rect(surf, monogram_color(name), rect, border_radius=max(4, rect.w // 5))
+    img = font.render(monogram_text(name), True, (255, 255, 255))
+    surf.blit(img, img.get_rect(center=rect.center))
+
+
+def draw_check_badge(surf, center, radius: int, fill):
+    """A filled circle with a white tick, for installed or selected apps."""
+    pygame.draw.circle(surf, fill, center, radius)
+    cx, cy = center
+    w = max(2, radius // 4)
+    pts = [(cx - radius * 0.45, cy), (cx - radius * 0.1, cy + radius * 0.35), (cx + radius * 0.5, cy - radius * 0.35)]
+    pygame.draw.lines(surf, (255, 255, 255), False, [(int(x), int(y)) for x, y in pts], w)
+
+
+def draw_chip(surf, text: str, font, pos, fg, bg):
+    """A small rounded label; returns its rect."""
+    img = font.render(text, True, fg)
+    rect = pygame.Rect(pos[0], pos[1], img.get_width() + S(20), img.get_height() + S(8))
+    pygame.draw.rect(surf, bg, rect, border_radius=rect.h // 2)
+    surf.blit(img, (rect.x + S(10), rect.y + S(4)))
+    return rect
+
+
+def draw_icon(surf, kind: str, center, size: int, color):
+    """Simple line icons drawn with pygame, so no image files are needed."""
+    cx, cy = center
+    half = size / 2
+    w = max(2, size // 12)
+
+    def P(x, y):
+        return (int(cx + x * half), int(cy + y * half))
+
+    if kind == "games":
+        body = pygame.Rect(0, 0, int(size * 0.92), int(size * 0.54))
+        body.center = (cx, cy)
+        pygame.draw.rect(surf, color, body, width=w, border_radius=int(size * 0.24))
+        dx, dy = P(-0.46, 0)
+        a = int(size * 0.11)
+        pygame.draw.line(surf, color, (dx - a, dy), (dx + a, dy), w)
+        pygame.draw.line(surf, color, (dx, dy - a), (dx, dy + a), w)
+        for bx, by in ((0.36, -0.08), (0.52, 0.08)):
+            pygame.draw.circle(surf, color, P(bx, by), max(2, int(size * 0.055)))
+    elif kind == "windows":
+        gap = max(2, int(size * 0.07))
+        q = int(size * 0.34)
+        for ix in (-1, 1):
+            for iy in (-1, 1):
+                r = pygame.Rect(0, 0, q, q)
+                r.center = (cx + ix * (q + gap) // 2, cy + iy * (q + gap) // 2)
+                pygame.draw.rect(surf, color, r, border_radius=max(1, int(size * 0.04)))
+    elif kind == "toolbox":
+        box = pygame.Rect(0, 0, int(size * 0.88), int(size * 0.52))
+        box.midbottom = (cx, cy + int(size * 0.34))
+        pygame.draw.rect(surf, color, box, width=w, border_radius=int(size * 0.07))
+        handle = pygame.Rect(0, 0, int(size * 0.36), int(size * 0.22))
+        handle.midbottom = (cx, box.top + w)
+        pygame.draw.rect(surf, color, handle, width=w, border_radius=int(size * 0.05))
+        mid = box.top + box.h // 3
+        pygame.draw.line(surf, color, (box.left, mid), (box.right - 1, mid), w)
+    elif kind == "monitor":
+        scr = pygame.Rect(0, 0, int(size * 0.9), int(size * 0.58))
+        scr.midtop = (cx, cy - int(size * 0.38))
+        pygame.draw.rect(surf, color, scr, width=w, border_radius=int(size * 0.06))
+        foot = scr.bottom + int(size * 0.16)
+        pygame.draw.line(surf, color, (cx, scr.bottom), (cx, foot), w)
+        pygame.draw.line(surf, color, (cx - int(size * 0.22), foot), (cx + int(size * 0.22), foot), w)
+    elif kind == "code":
+        for sign in (-1, 1):
+            pygame.draw.lines(surf, color, False, [P(sign * 0.32, -0.34), P(sign * 0.7, 0), P(sign * 0.32, 0.34)], w)
+        pygame.draw.line(surf, color, P(0.14, -0.44), P(-0.14, 0.44), w)
+    elif kind == "docker":
+        q = int(size * 0.24)
+        gap = max(2, int(size * 0.06))
+        bw = max(2, w - 1)
+        for ix in (-1, 0, 1):
+            r = pygame.Rect(0, 0, q, q)
+            r.center = (cx + ix * (q + gap), cy + (q + gap) // 2)
+            pygame.draw.rect(surf, color, r, width=bw, border_radius=max(1, q // 6))
+        for ix in (-0.5, 0.5):
+            r = pygame.Rect(0, 0, q, q)
+            r.center = (int(cx + ix * (q + gap)), cy - (q + gap) // 2)
+            pygame.draw.rect(surf, color, r, width=bw, border_radius=max(1, q // 6))
+    elif kind == "wine":
+        bowl = [P(-0.36, -0.5), P(0.36, -0.5), P(0.28, -0.02), P(0, 0.12), P(-0.28, -0.02)]
+        pygame.draw.polygon(surf, color, bowl, w)
+        pygame.draw.line(surf, color, P(-0.3, -0.24), P(0.3, -0.24), w)
+        pygame.draw.line(surf, color, P(0, 0.12), P(0, 0.46), w)
+        pygame.draw.line(surf, color, P(-0.26, 0.48), P(0.26, 0.48), w)
+    elif kind == "update":
+        r = pygame.Rect(0, 0, int(size * 0.74), int(size * 0.74))
+        r.center = (cx, cy)
+        pygame.draw.arc(surf, color, r, math.radians(50), math.radians(330), w)
+        rad = r.w / 2
+        tip = (cx + rad * math.cos(math.radians(50)), cy - rad * math.sin(math.radians(50)))
+        a = size * 0.2
+        pygame.draw.line(surf, color, tip, (tip[0] - a, tip[1] - a * 0.15), w)
+        pygame.draw.line(surf, color, tip, (tip[0] + a * 0.1, tip[1] + a), w)
+    elif kind == "gear":
+        radius = size * 0.28
+        for k in range(8):
+            ang = math.radians(k * 45)
+            p1 = (cx + radius * 0.9 * math.cos(ang), cy + radius * 0.9 * math.sin(ang))
+            p2 = (cx + radius * 1.5 * math.cos(ang), cy + radius * 1.5 * math.sin(ang))
+            pygame.draw.line(surf, color, p1, p2, w * 2)
+        pygame.draw.circle(surf, color, (cx, cy), int(radius), w)
+        pygame.draw.circle(surf, color, (cx, cy), max(2, int(radius * 0.4)), w)
+    elif kind == "power":
+        r = pygame.Rect(0, 0, int(size * 0.76), int(size * 0.76))
+        r.center = (cx, cy + int(size * 0.04))
+        pygame.draw.arc(surf, color, r, math.radians(120), math.radians(420), w)
+        pygame.draw.line(surf, color, P(0, -0.5), P(0, -0.04), w)
+    else:
+        pygame.draw.circle(surf, color, (cx, cy), int(size * 0.35), w)
+
+
+def draw_footer(surf, hints: str, status: str = "") -> int:
+    """Bottom button bar: status text on the left, button hints on the right.
+    Returns the bar height."""
+    h = S(54)
+    bar = pygame.Surface((W, h), pygame.SRCALPHA)
+    bar.fill((*FOOTER_BG, 215))
+    surf.blit(bar, (0, H - h))
+    pygame.draw.line(surf, (34, 45, 58), (0, H - h), (W, H - h), 1)
+    font = UI_FONTS["body"]
+    y = H - h + (h - font.get_height()) // 2
+    # Measure the hints off-screen first so they can be right-aligned
+    scratch = pygame.Surface((W, h), pygame.SRCALPHA)
+    hints_w = draw_hints_line(scratch, hints, font, FG, (0, 0), sep_text="     ")
+    hints_x = max(S(48), W - S(48) - hints_w)
+    if status:
+        draw_text(surf, fit_text(status, font, max(0, hints_x - S(96))), font, MUTED, (S(48), y))
+    draw_hints_line(surf, hints, font, FG, (hints_x, y), sep_text="     ")
+    return h
+
+
+def grid_move(rects, idx: int, dx: int, dy: int) -> int:
+    """Index of the nearest rect in direction (dx, dy) from rects[idx], or idx.
+    Left/right stay on the same row; up/down pick the closest tile above/below."""
+    if not rects or idx >= len(rects) or rects[idx] is None:
+        return idx
+    cur = rects[idx]
+    best, best_score = idx, None
+    for i, r in enumerate(rects):
+        if i == idx or r is None:
+            continue
+        ddx, ddy = r.centerx - cur.centerx, r.centery - cur.centery
+        primary = ddx * dx + ddy * dy
+        if primary <= 0:
+            continue
+        if dx and not (r.top < cur.bottom and r.bottom > cur.top):
+            continue
+        score = primary + 2 * (abs(ddy) if dx else abs(ddx))
+        if best_score is None or score < best_score:
+            best, best_score = i, score
+    return best
+
+
+def draw_app_tile(surf, rect, key: str, selected: bool, checked: bool, installed: bool):
+    """One app in a category grid: monogram, name, and installed/selected badges."""
+    f = UI_FONTS
+    if selected:
+        rect = rect.inflate(S(10), S(10))
+    draw_tile(surf, rect, selected)
+    mono = max(S(32), min(rect.w - S(48), rect.h - f["body"].get_height() - S(48)))
+    mono_rect = pygame.Rect(0, 0, mono, mono)
+    mono_rect.midtop = (rect.centerx, rect.y + S(18))
+    draw_monogram(surf, mono_rect, key, f["monogram"])
+    name = f["body"].render(fit_text(key, f["body"], rect.w - S(20)), True, FG)
+    surf.blit(name, name.get_rect(midtop=(rect.centerx, mono_rect.bottom + S(12))))
+    badge_r = S(12)
+    if installed:
+        draw_check_badge(surf, (rect.x + S(18), rect.y + S(18)), badge_r, SUCCESS)
+    if checked:
+        draw_check_badge(surf, (rect.right - S(18), rect.y + S(18)), badge_r, ACCENT)
+    elif selected:
+        pygame.draw.circle(surf, MUTED, (rect.right - S(18), rect.y + S(18)), badge_r, max(2, S(2)))
+
+
+def draw_app_details(surf, panel, key: str):
+    """Details of the selected app, in the panel beside the grid."""
+    f = UI_FONTS
+    draw_tile(surf, panel, radius=S(18))
+    pad = S(24)
+    x = panel.x + pad
+    inner_w = panel.w - 2 * pad
+    mono = pygame.Rect(x, panel.y + pad, S(88), S(88))
+    draw_monogram(surf, mono, key, f["monogram_big"])
+    y = mono.bottom + S(18)
+    for line in wrap(key, inner_w, f["hero"])[:2]:
+        draw_text(surf, line, f["hero"], FG, (x, y))
+        y += f["hero"].get_height()
+    y += S(12)
+
+    # Status chips
+    chip_x = x
+    if is_installed(key):
+        chip = draw_chip(surf, t("installed"), f["small"], (chip_x, y), (196, 245, 218), (24, 82, 54))
+        chip_x = chip.right + S(8)
+    if any(k == key for k, _cmd in INSTALL_QUEUE):
+        chip = draw_chip(surf, t("queued"), f["small"], (chip_x, y), (205, 230, 255), (26, 70, 120))
+        chip_x = chip.right + S(8)
+    if SELECTED_APPS.get(key, False):
+        badge_r = (f["small"].get_height() + S(8)) // 2
+        draw_check_badge(surf, (chip_x + badge_r, y + badge_r), badge_r, ACCENT)
+        chip_x += 2 * badge_r + S(8)
+    if chip_x != x:
+        y += f["small"].get_height() + S(20)
+
+    if is_installed(key):
+        draw_text(surf, fit_text(f"{t('last_installed')} {get_last_install_date(key)}", f["small"], inner_w),
+                  f["small"], MUTED, (x, y))
+        y += f["small"].get_height() + S(14)
+
+    # Description, as many lines as fit
+    line_h = f["body"].get_height() + S(4)
+    max_lines = max(0, (panel.bottom - pad - y) // line_h)
+    for line in wrap(DESCRIPTIONS.get(key, ""), inner_w, f["body"])[:max_lines]:
+        draw_text(surf, line, f["body"], (196, 206, 218), (x, y))
+        y += line_h
 
 # ------------------------------
 # Process runner with live log
@@ -1895,6 +2176,13 @@ class MenuScreen(BaseScreen):
         self.search_mode = False
         self.search_query = ""
         self.keyboard = OnScreenKeyboard()
+        self.rects = []  # tile positions from the last draw, for grid navigation
+
+    def move(self, dx: int, dy: int):
+        if self.rects:
+            self.idx = grid_move(self.rects, self.idx, dx, dy)
+        elif dx or dy:
+            self.idx = (self.idx + (dx or dy)) % len(self.items)
 
     def calculate_stats(self):
         """Calculate installation statistics"""
@@ -1949,11 +2237,9 @@ class MenuScreen(BaseScreen):
             return
 
         # Process analog stick for navigation (arcade cabinet support)
-        analog_v, _analog_h = process_analog_navigation(events)
-        if analog_v == 1:  # Down
-            self.idx = (self.idx + 1) % len(self.items)
-        elif analog_v == -1:  # Up
-            self.idx = (self.idx - 1) % len(self.items)
+        analog_v, analog_h = process_analog_navigation(events)
+        if analog_v or analog_h:
+            self.move(analog_h, analog_v)
 
         for e in events:
             if e.type == pygame.QUIT:
@@ -1964,10 +2250,14 @@ class MenuScreen(BaseScreen):
                     self.search_mode = True
                     self.search_query = ""
                     return
-                if e.key in (pygame.K_DOWN,):
-                    self.idx = (self.idx + 1) % len(self.items)
-                if e.key in (pygame.K_UP,):
-                    self.idx = (self.idx - 1) % len(self.items)
+                if e.key == pygame.K_DOWN:
+                    self.move(0, 1)
+                if e.key == pygame.K_UP:
+                    self.move(0, -1)
+                if e.key == pygame.K_LEFT:
+                    self.move(-1, 0)
+                if e.key == pygame.K_RIGHT:
+                    self.move(1, 0)
                 # Keyboard A -> Enter (activate per hints)
                 if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     self.activate()
@@ -1977,12 +2267,10 @@ class MenuScreen(BaseScreen):
                     else:
                         clean_exit(0)
             if e.type == pygame.JOYHATMOTION:
-                # D-Pad
+                # D-Pad (hat y is +1 for up, the screen's y runs down)
                 x, y = e.value
-                if y == -1:
-                    self.idx = (self.idx + 1) % len(self.items)
-                elif y == 1:
-                    self.idx = (self.idx - 1) % len(self.items)
+                if x or y:
+                    self.move(x, -y)
             if e.type == pygame.JOYBUTTONDOWN:
                 # Normalize to logical buttons via BTN_*
                 if e.button in (BTN_A,):
@@ -2038,51 +2326,42 @@ class MenuScreen(BaseScreen):
 
     def draw(self):
         draw_background(screen)
-        header_y = S(18)
-        header_h = 0
-        try:
-            if WHEEL_SURF is not None:
-                # --- Trim transparent padding first ---
-                trimmed_rect = WHEEL_SURF.get_bounding_rect()  # auto-detect non-transparent area
-                trimmed = WHEEL_SURF.subsurface(trimmed_rect).copy()
+        f = UI_FONTS
+        margin = S(48)
+        top_y = S(28)
+        header_h = S(56)
 
-                # --- Wheel logo height (set to 100)
-                target_h = S(100)
-                scale = target_h / trimmed.get_height()
-                target_w = int(trimmed.get_width() * scale)
-                wheel = pygame.transform.smoothscale(trimmed, (target_w, target_h))
-
-            # --- Draw centered horizontally or aligned as before ---
-                x = (screen.get_width() - target_w) // 2
-                screen.blit(wheel, (x, header_y))
-                header_h = target_h
-            else:
-                draw_text(screen, self.title, FONT_BIG, FG, (40, 30))
-                header_h = FONT_BIG.get_height()
-        except Exception:
-            draw_text(screen, self.title, FONT_BIG, FG, (40, 30))
-            header_h = FONT_BIG.get_height()
+        # Header: logo on the left, overall progress on the right
+        drew_logo = False
+        if WHEEL_SURF is not None:
+            try:
+                trimmed = WHEEL_SURF.subsurface(WHEEL_SURF.get_bounding_rect()).copy()
+                scale = header_h / trimmed.get_height()
+                logo = pygame.transform.smoothscale(trimmed, (int(trimmed.get_width() * scale), header_h))
+                screen.blit(logo, (margin, top_y))
+                drew_logo = True
+            except Exception:
+                pass
+        if not drew_logo:
+            draw_text(screen, self.title, f["hero"], FG, (margin, top_y + (header_h - f["hero"].get_height()) // 2))
+        if self.stats:
+            inst, total = self.stats['total_installed'], self.stats['total_available']
+            label = f"{t('installed')}: {inst} {t('of')} {total} {t('addons')}"
+            img = f["body"].render(label, True, FG)
+            bar = pygame.Rect(0, 0, max(img.get_width(), S(240)), S(6))
+            bar.topright = (W - margin, top_y + header_h // 2 + S(6))
+            screen.blit(img, (bar.right - img.get_width(), bar.top - img.get_height() - S(6)))
+            pygame.draw.rect(screen, CARD_HI, bar, border_radius=bar.h // 2)
+            if total and inst:
+                done = bar.copy()
+                done.w = max(bar.h, int(bar.w * inst / total))
+                pygame.draw.rect(screen, SUCCESS, done, border_radius=bar.h // 2)
 
         # Search overlay when typing
         if self.search_mode:
-            search_box = pygame.Rect(S(40), header_y + header_h + S(10), W - S(80), S(50))
-            pygame.draw.rect(screen, CARD, search_box, border_radius=8)
-            pygame.draw.rect(screen, ACCENT, search_box, width=2, border_radius=8)
-            # Keyboard draws its own input at the top
+            # The keyboard draws its own input box
             self.keyboard.draw(screen, self.search_query)
             return
-
-        # Show stats on main menu
-        if self.stats:
-            # Place stats under the header/banner
-            stats_y = header_y + header_h + S(12)
-            total_text = (
-                f"{t('installed')}: {self.stats['total_installed']} {t('of')} {self.stats['total_available']} {t('addons')}"
-                f"  |  A={t('hint_open')}  |  X={t('hint_search')}  |  Back={t('hint_back_settings')}  |  {t('input')}: {input_style_label()}"
-            )
-            draw_hints_line(screen, total_text, FONT_SMALL, ACCENT, (S(40), stats_y))
-
-        list_y = (stats_y + S(35)) if self.stats else (header_y + header_h + S(20))
 
         # Create reverse mapping from translated to English category names
         category_map = {
@@ -2094,47 +2373,77 @@ class MenuScreen(BaseScreen):
             t("docker_menu"): "Docker Menu",
         }
 
-        # Scrollable cards sized to fit the screen height
-        total = len(self.items)
-        row_pitch = S(70)
-        row_h = S(60)
-        bottom_pad = S(40)
-        avail_h = max(0, H - list_y - bottom_pad)
-        rows = min(total, get_visible_items(avail_h, row_pitch))
-        top = 0 if total <= rows else max(0, min(self.idx - rows // 2, total - rows))
-        view = self.items[top:top + rows]
+        # Categories get big tiles; Custom Wine, Updater, Settings and Exit a row of small ones
+        big = [i for i, (name, _d) in enumerate(self.items) if category_map.get(name, name) in CATEGORIES]
+        small = [i for i in range(len(self.items)) if i not in big]
+        footer_h = S(54)
+        desc_h = S(44)
+        gap = S(18)
+        small_h = S(76) if small else 0
+        grid_top = top_y + header_h + S(30)
+        grid_bottom = H - footer_h - desc_h - (small_h + gap if small else 0)
+        cols = 3 if len(big) > 4 else max(1, len(big))
+        rows = math.ceil(len(big) / cols) if big else 0
+        tile_w = (W - 2 * margin - (cols - 1) * gap) // cols
+        tile_h = max(S(110), min(S(200), (grid_bottom - grid_top - (rows - 1) * gap) // max(1, rows)))
 
-        x = S(40)
-        for i, (name, desc) in enumerate(view):
-            actual_idx = top + i
-            y = list_y + i * row_pitch
-            rect = pygame.Rect(x, y, W - S(80), row_h)
-            pygame.draw.rect(screen, CARD, rect, border_radius=12)
-            if actual_idx == self.idx:
-                pygame.draw.rect(screen, SELECT, rect, width=3, border_radius=12)
+        rects = [None] * len(self.items)
+        for n, i in enumerate(big):
+            r, c = divmod(n, cols)
+            rects[i] = pygame.Rect(margin + c * (tile_w + gap), grid_top + r * (tile_h + gap), tile_w, tile_h)
+        if small:
+            small_y = grid_top + rows * (tile_h + gap) if rows else grid_top
+            small_w = (W - 2 * margin - (len(small) - 1) * gap) // len(small)
+            for n, i in enumerate(small):
+                rects[i] = pygame.Rect(margin + n * (small_w + gap), small_y, small_w, small_h)
+        self.rects = rects
 
-            # Category name
-            draw_text(screen, name, FONT, FG, (rect.x + S(16), rect.y + S(10)))
+        icons = dict(HOME_ICONS)
+        icons.update({"Custom Wine": "wine", "Updater": "update", "Settings": "gear", "Exit": "power"})
+        special = {t("custom_wine"): "Custom Wine", t("updater"): "Updater", t("settings"): "Settings", t("exit"): "Exit"}
 
-            # Show category stats if available
-            # Map translated name back to English for stats lookup
-            english_name = category_map.get(name, name)
-            if self.stats and english_name in self.stats['category_stats']:
-                installed, total = self.stats['category_stats'][english_name]
-                stat_text = f"[{installed}/{total}]"
-                stat_color = ACCENT if installed > 0 else MUTED
-                draw_text(screen, stat_text, FONT_SMALL, stat_color, (rect.x + S(16), rect.y + S(32)))
-                desc_x = rect.x + S(90)
+        # Selected tile last, so its enlarged outline sits on top of its neighbours
+        for i in [i for i in range(len(self.items)) if i != self.idx] + [self.idx]:
+            name, _desc = self.items[i]
+            selected = i == self.idx
+            rect = rects[i].inflate(S(10), S(10)) if selected else rects[i]
+            draw_tile(screen, rect, selected)
+            english = category_map.get(name, special.get(name, name))
+            kind = icons.get(english, "")
+            icon_color = ACCENT if selected else (172, 184, 198)
+            if english == "Exit" and selected:
+                icon_color = (240, 96, 96)
+            if i in big:
+                isz = S(52)
+                pad = S(24)
+                draw_icon(screen, kind, (rect.x + pad + isz // 2, rect.y + pad + isz // 2), isz, icon_color)
+                draw_text(screen, fit_text(name, f["tile"], rect.w - 2 * pad), f["tile"], FG,
+                          (rect.x + pad, rect.bottom - S(64)))
+                if self.stats and english in self.stats['category_stats']:
+                    inst, total = self.stats['category_stats'][english]
+                    count = f["small"].render(f"{inst} / {total}", True, SUCCESS if inst else MUTED)
+                    bar = pygame.Rect(rect.x + pad, rect.bottom - S(28), rect.w - 2 * pad - count.get_width() - S(12), S(5))
+                    pygame.draw.rect(screen, (44, 58, 74), bar, border_radius=bar.h // 2)
+                    if total and inst:
+                        done = bar.copy()
+                        done.w = max(bar.h, int(bar.w * inst / total))
+                        pygame.draw.rect(screen, SUCCESS, done, border_radius=bar.h // 2)
+                    screen.blit(count, (bar.right + S(12), bar.centery - count.get_height() // 2))
             else:
-                desc_x = rect.x + S(16)
+                isz = S(36)
+                pad = S(20)
+                draw_icon(screen, kind, (rect.x + pad + isz // 2, rect.centery), isz, icon_color)
+                label_x = rect.x + pad + isz + S(16)
+                draw_text(screen, fit_text(name, f["tile"], rect.right - pad - label_x), f["tile"], FG,
+                          (label_x, rect.centery - f["tile"].get_height() // 2))
 
-            # Description - calculate available width properly
-            available_width = rect.x + rect.w - desc_x - S(16)  # Leave 16px padding on right
-            lines = wrap(desc, available_width, FONT_SMALL)
-            for li, ln in enumerate(lines[:2]):
-                draw_text(screen, ln, FONT_SMALL, MUTED, (desc_x, rect.y + S(34) + li*S(18)))
-            
-            # per-card hint removed (now shown in top bar)
+        # Description of the selected tile, above the button bar
+        desc = self.items[self.idx][1]
+        desc_y = H - footer_h - desc_h + (desc_h - f["body"].get_height()) // 2
+        draw_text(screen, fit_text(desc, f["body"], W - 2 * margin), f["body"], MUTED, (margin, desc_y))
+
+        draw_footer(screen, f"A={t('hint_open')} | X={t('hint_search')} | Back={t('hint_back_settings')}",
+                    f"{t('input')}: {input_style_label()}")
 
 
 class ConfirmDialog(BaseScreen):
@@ -3016,17 +3325,34 @@ class ChecklistScreen(BaseScreen):
         self.last_action_time = 0
         self.action_cooldown = 0.2  # 200ms cooldown to prevent double inputs
         self.keyboard = OnScreenKeyboard()
+        self.cols = 1        # grid columns from the last draw, for navigation
+        self.scroll_row = 0  # first grid row on screen
+
+    def move(self, dx: int, dy: int):
+        """Move the selection around the grid; left/right stay on the row."""
+        if not self.items:
+            return
+        n, cols = len(self.items), max(1, self.cols)
+        if dx:
+            new = self.idx + dx
+            if 0 <= new < n and new // cols == self.idx // cols:
+                self.idx = new
+        if dy:
+            new = self.idx + dy * cols
+            # Down from a row above a shorter last row lands on its last tile
+            if dy > 0 and new >= n and (n - 1) // cols > self.idx // cols:
+                new = n - 1
+            if 0 <= new < n:
+                self.idx = new
 
     def handle(self, events):
         current_time = pygame.time.get_ticks() / 1000.0
         # Category screens do not support on-screen keyboard search
 
         # Process analog stick for navigation (arcade cabinet support)
-        analog_v, _analog_h = process_analog_navigation(events)
-        if analog_v == 1:  # Down
-            self.idx = (self.idx + 1) % len(self.items)
-        elif analog_v == -1:  # Up
-            self.idx = (self.idx - 1) % len(self.items)
+        analog_v, analog_h = process_analog_navigation(events)
+        if analog_v or analog_h:
+            self.move(analog_h, analog_v)
 
         for e in events:
             if e.type == pygame.QUIT:
@@ -3035,10 +3361,14 @@ class ChecklistScreen(BaseScreen):
                 if e.key == pygame.K_ESCAPE:
                     pop_screen()
                     return
-                if e.key in (pygame.K_DOWN,):
-                    self.idx = (self.idx + 1) % len(self.items)
-                if e.key in (pygame.K_UP,):
-                    self.idx = (self.idx - 1) % len(self.items)
+                if e.key == pygame.K_DOWN:
+                    self.move(0, 1)
+                if e.key == pygame.K_UP:
+                    self.move(0, -1)
+                if e.key == pygame.K_LEFT:
+                    self.move(-1, 0)
+                if e.key == pygame.K_RIGHT:
+                    self.move(1, 0)
                 # Match hints: Enter toggles selection (A)
                 if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     if current_time - self.last_action_time > self.action_cooldown:
@@ -3064,11 +3394,10 @@ class ChecklistScreen(BaseScreen):
                         self.last_action_time = current_time
                 # (Removed keyboard Y shortcut; A handles select all per hints)
             if e.type == pygame.JOYHATMOTION:
-                _x, y = e.value
-                if y == -1:
-                    self.idx = (self.idx + 1) % len(self.items)
-                elif y == 1:
-                    self.idx = (self.idx - 1) % len(self.items)
+                # hat y is +1 for up, the screen's y runs down
+                x, y = e.value
+                if x or y:
+                    self.move(x, -y)
             if e.type == pygame.JOYBUTTONDOWN:
                 if e.button in (BTN_A,):  # A
                     if current_time - self.last_action_time > self.action_cooldown:
@@ -3192,72 +3521,77 @@ class ChecklistScreen(BaseScreen):
 
     def draw(self):
         draw_background(screen)
-        draw_text(screen, f"{self.category}", FONT_BIG, FG, (40, 30))
-
-        # Show queue count and installation stats
+        f = UI_FONTS
+        margin = S(48)
+        top_y = S(28)
         installed_count = sum(1 for k in self.all_items if is_installed(k))
 
-        # Normal view (search disabled at category level)
+        # Header: category name, counts, and the "added to queue" message
+        draw_text(screen, self.category, f["hero"], FG, (margin, top_y))
+        sub_y = top_y + f["hero"].get_height() + S(4)
+        draw_text(screen, f"{t('installed')}: {installed_count}/{len(self.all_items)}     {t('queue')}: {len(INSTALL_QUEUE)}",
+                  f["body"], MUTED, (margin, sub_y))
+        current_time = pygame.time.get_ticks() / 1000.0
+        if self.queue_message and (current_time - self.queue_message_time) < 2.0:
+            img = f["body"].render(self.queue_message, True, FG)
+            chip = pygame.Rect(0, 0, img.get_width() + S(28), img.get_height() + S(14))
+            chip.topright = (W - margin, top_y + S(6))
+            pygame.draw.rect(screen, ACCENT, chip, border_radius=chip.h // 2)
+            screen.blit(img, img.get_rect(center=chip.center))
+
         any_selected = any(SELECTED_APPS.get(k, False) for k in self.items) if self.items else False
         all_selected = all(SELECTED_APPS.get(k, False) for k in self.items) if self.items else False
         y_label = t("hint_remove_all") if all_selected else t("hint_add_all")
         start_label = t("hint_start") if any_selected else t("queue")
-        queue_text = (
-            f"{t('queue')}: {len(INSTALL_QUEUE)} | {t('installed')}: {installed_count}/{len(self.all_items)} "
-            f"| A={t('hint_toggle')} | Y={y_label} | Start={start_label} | B={t('hint_return')} | Back={t('hint_back_settings')}"
+        footer_h = draw_footer(
+            screen,
+            f"A={t('hint_toggle')} | Y={y_label} | Start={start_label} | B={t('hint_return')}",
+            f"{t('input')}: {input_style_label()}",
         )
-        draw_hints_line(screen, queue_text, FONT_SMALL, ACCENT, (S(40), S(70)))
-        base_y = S(110)
-        
-        # Show temporary message if items were just added to queue
-        current_time = pygame.time.get_ticks() / 1000.0
-        if self.queue_message and (current_time - self.queue_message_time) < 2.0:
-            msg_color = ACCENT
-            draw_text(screen, self.queue_message, FONT, msg_color, (40, base_y))
-            base_y += 40
-        
-        # Items list
+
+        grid_top = sub_y + f["body"].get_height() + S(26)
+        grid_bottom = H - footer_h - S(20)
         if not self.items:
-            draw_text(screen, t("no_addons_category"), FONT, MUTED, (40, base_y))
+            draw_text(screen, t("no_addons_category"), f["body"], MUTED, (margin, grid_top))
             return
 
-        # scroll logic
-        item_pitch = S(55)
-        avail_h = H - base_y - S(40)
-        rows = min(len(self.items), get_visible_items(avail_h, item_pitch))
-        top = max(0, min(self.idx - rows//2, len(self.items)-rows))
-        view = self.items[top:top+rows]
-        
-        for i, key in enumerate(view):
-            actual_idx = top + i
-            rect = pygame.Rect(S(40), base_y + i*S(55), W - S(80), S(50))
-            pygame.draw.rect(screen, CARD, rect, border_radius=10)
-            if actual_idx == self.idx:
-                pygame.draw.rect(screen, SELECT, rect, width=3, border_radius=10)
+        # Grid of app tiles on the left, details of the selected app on the right
+        panel_w = max(S(300), int(W * 0.3))
+        panel = pygame.Rect(W - margin - panel_w, grid_top, panel_w, grid_bottom - grid_top)
+        grid_w = panel.x - S(32) - margin
+        gap = S(16)
+        cols = max(1, (grid_w + gap) // (S(150) + gap))
+        tile_w = (grid_w - (cols - 1) * gap) // cols
+        grid_h = grid_bottom - grid_top
+        rows_visible = max(1, (grid_h + gap) // (int(tile_w * 0.8) + gap))
+        tile_h = min(int(tile_w * 1.05), (grid_h - (rows_visible - 1) * gap) // rows_visible)
+        self.cols = cols
+        total_rows = math.ceil(len(self.items) / cols)
+        sel_row = self.idx // cols
+        if sel_row < self.scroll_row:
+            self.scroll_row = sel_row
+        if sel_row >= self.scroll_row + rows_visible:
+            self.scroll_row = sel_row - rows_visible + 1
+        self.scroll_row = max(0, min(self.scroll_row, total_rows - rows_visible))
 
-            # checkbox
-            box = pygame.Rect(rect.x + S(14), rect.y + S(12), S(24), S(24))
-            pygame.draw.rect(screen, FG if SELECTED_APPS[key] else MUTED, box, width=2)
-            if SELECTED_APPS[key]:
-                pygame.draw.line(screen, FG, (box.x + S(4), box.centery), (box.centerx, box.bottom - S(5)), 3)
-                pygame.draw.line(screen, FG, (box.centerx, box.bottom - S(5)), (box.right - S(4), box.y + S(5)), 3)
-            
-            # "Already installed" indicator
-            installed = is_installed(key)
-            if installed:
-                # Small green dot indicator
-                dot_x = box.right + S(8)
-                dot_y = box.y + S(4)
-                pygame.draw.circle(screen, ACCENT, (dot_x, dot_y), S(5))
-            
-            # labels
-            name_x = box.right + (S(20) if installed else S(12))
-            draw_text(screen, key, FONT, FG, (name_x, rect.y + S(8)))
-            desc = DESCRIPTIONS.get(key, "")
-            if desc:
-                draw_text(screen, desc, FONT_SMALL, MUTED, (name_x, rect.y + S(30)))
-        
-        # no search keyboard on category screens
+        first = self.scroll_row * cols
+        shown = range(first, min(len(self.items), first + rows_visible * cols))
+        for i in [i for i in shown if i != self.idx] + ([self.idx] if self.idx in shown else []):
+            r, c = divmod(i - first, cols)
+            rect = pygame.Rect(margin + c * (tile_w + gap), grid_top + r * (tile_h + gap), tile_w, tile_h)
+            key = self.items[i]
+            draw_app_tile(screen, rect, key, i == self.idx, SELECTED_APPS.get(key, False), is_installed(key))
+
+        # Scroll bar when not every row fits
+        if total_rows > rows_visible:
+            track = pygame.Rect(panel.x - S(18), grid_top, S(4), grid_bottom - grid_top)
+            pygame.draw.rect(screen, CARD, track, border_radius=track.w // 2)
+            thumb = track.copy()
+            thumb.h = max(S(24), track.h * rows_visible // total_rows)
+            thumb.y = track.y + (track.h - thumb.h) * self.scroll_row // max(1, total_rows - rows_visible)
+            pygame.draw.rect(screen, MUTED, thumb, border_radius=track.w // 2)
+
+        draw_app_details(screen, panel, self.items[self.idx])
 
 
 class GlobalSearchScreen(BaseScreen):
