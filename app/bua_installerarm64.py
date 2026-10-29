@@ -13,6 +13,7 @@ import io
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+import urllib.error
 import urllib.request
 import urllib.parse
 import time
@@ -1764,6 +1765,241 @@ def draw_monogram(surf, rect, name: str, font):
     surf.blit(img, img.get_rect(center=rect.center))
 
 
+# ------------------------------
+# App logos
+# ------------------------------
+# BUA guesses each app's logo: an image its installer downloads, otherwise
+# the best-named image in its folder of the repo. Logos download in the
+# background and are kept in LOGO_DIR; until one arrives, the app shows its
+# monogram.
+
+LOGO_DIR = "/userdata/system/add-ons/bua_logos"
+LOGO_INDEX_FILE = os.path.join(LOGO_DIR, "index.json")
+REPO_TREE_URL = "https://api.github.com/repos/batocera-unofficial-addons/batocera-unofficial-addons/git/trees/main?recursive=1"
+LOGO_INDEX_MAX_AGE = 7 * 24 * 3600  # guess again after a week, to pick up new logos
+# Images that are not logos: key maps, controller pictures, backgrounds
+LOGO_SKIP = re.compile(r"(key|joy|acima|abaixo|direita|esquerda|button|screenshot|controller|wallpaper|background|splash)", re.I)
+
+_logo_lock = threading.Lock()
+_logo_index: Dict[str, str] = {}      # app -> logo file, or "" when none was found
+_logo_index_time = 0.0
+_logo_loaded = False
+_logo_pending: List[str] = []
+_logo_requested: set = set()
+_logo_surfaces: Dict[tuple, pygame.Surface | None] = {}
+_logo_tree: List[str] | None = None
+_logo_thread: threading.Thread | None = None
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _load_logo_index():
+    global _logo_index, _logo_index_time, _logo_loaded
+    _logo_loaded = True
+    try:
+        with open(LOGO_INDEX_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if time.time() - data.get("time", 0) < LOGO_INDEX_MAX_AGE:
+            _logo_index_time = data["time"]
+            _logo_index = {k: v for k, v in data.get("apps", {}).items() if not v or os.path.exists(v)}
+    except Exception:
+        pass
+
+
+def _save_logo_index():
+    global _logo_index_time
+    try:
+        os.makedirs(LOGO_DIR, exist_ok=True)
+        _logo_index_time = _logo_index_time or time.time()
+        with _logo_lock:
+            data = {"time": _logo_index_time, "apps": dict(_logo_index)}
+        tmp = LOGO_INDEX_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, LOGO_INDEX_FILE)
+    except Exception as e:
+        print(f"[BUA] Could not save logo index: {e}")
+
+
+def _app_folder(app: str) -> str | None:
+    m = re.search(r"batocera-unofficial-addons/(?:raw/refs/heads/main|raw/main|refs/heads/main|main)/([^/\s]+)/", APPS.get(app, ""))
+    return m.group(1) if m else None
+
+
+def _logo_score(path: str) -> int:
+    """How much an image path looks like a logo; 0 means not at all."""
+    low = path.lower()
+    return 3 if "logo" in low else 2 if "icon" in low else 1 if "thumb" in low else 0
+
+
+def _installer_logo_url(app: str) -> str | None:
+    """The logo or icon image the app's installer downloads, if it names one."""
+    m = re.search(r"https?://\S+?\.sh\b", APPS.get(app, ""))
+    if not m:
+        return None
+    src = fetch_url_with_retry(m.group(0), {"User-Agent": "BUA"}, timeout=8, retries=1).decode("utf-8", "replace")
+    # Fill in shell variables such as ${APPNAME,,} from the script's own assignments
+    shell_vars = dict(re.findall(r'^\s*([A-Za-z_]\w*)="?([^"\s$]+)"?\s*$', src, re.M))
+
+    def expand(url: str) -> str:
+        url = re.sub(r"\$\{(\w+),,\}", lambda v: shell_vars.get(v.group(1), "$").lower(), url)
+        return re.sub(r"\$\{(\w+)\}|\$(\w+)", lambda v: shell_vars.get(v.group(1) or v.group(2), "$"), url)
+
+    best, best_score = None, 0
+    for url in re.findall(r"https?://[^\s\"'<>()]+?\.(?:png|jpe?g)\b", src, re.I):
+        url = expand(url)
+        if "$" in url:
+            continue
+        # A GitHub page link (/blob/) to the file itself (/raw/)
+        url = re.sub(r"^(https?://github\.com/[^/]+/[^/]+)/blob/", r"\1/raw/", url)
+        path = urllib.parse.urlparse(url).path
+        if LOGO_SKIP.search(path.rsplit("/", 1)[-1]):
+            continue
+        score = _logo_score(path.replace("batocera-unofficial-addons", ""))
+        if score > best_score:
+            best, best_score = url, score
+    return best
+
+
+def _repo_images() -> List[str]:
+    """Paths of every PNG/JPEG in the repo, fetched once per run."""
+    global _logo_tree
+    if _logo_tree is None:
+        data = json.loads(fetch_url_with_retry(REPO_TREE_URL, {"User-Agent": "BUA"}, timeout=10))
+        _logo_tree = [e["path"] for e in data.get("tree", [])
+                      if e.get("type") == "blob" and re.search(r"\.(png|jpe?g)$", e["path"], re.I)]
+    return _logo_tree
+
+
+def _repo_logo_url(app: str) -> str | None:
+    """The best-named image in the app's folder. In a folder several apps
+    share, the file name must also match the app's name."""
+    folder = _app_folder(app)
+    if not folder:
+        return None
+    shared = sum(1 for k in APPS if _app_folder(k) == folder) > 1
+    app_slug = _slug(app)
+    best, best_score = None, 0
+    for path in _repo_images():
+        if not path.startswith(folder + "/"):
+            continue
+        base = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if LOGO_SKIP.search(base):
+            continue
+        core = re.sub(r"(logo|icon|thumb|marquee)", "", _slug(base))
+        named = len(core) >= 3 and (core in app_slug or app_slug in core)
+        if shared and not named:
+            continue
+        score = 4 * named + _logo_score(base) + ("/extra/" in path) - ("marquee" in base.lower())
+        if score > best_score:
+            best, best_score = path, score
+    return f"{BUA_BASE_URL}/{urllib.parse.quote(best)}" if best else None
+
+
+def _download_logo(url: str) -> str:
+    data = fetch_url_with_retry(url, {"User-Agent": "BUA"}, timeout=10, retries=0)
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        ext = ".png"
+    elif data[:3] == b"\xff\xd8\xff":
+        ext = ".jpg"
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        ext = ".webp"
+    elif data[:4] == b"GIF8":
+        ext = ".gif"
+    else:
+        return ""
+    os.makedirs(LOGO_DIR, exist_ok=True)
+    path = os.path.join(LOGO_DIR, hashlib.md5(url.encode("utf-8")).hexdigest() + ext)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def _find_logo(app: str) -> str:
+    """Download the app's logo and return its file, or "" when there is none.
+    A logo the installer names that turns out missing or not an image falls
+    back to the folder guess."""
+    for finder in (_installer_logo_url, _repo_logo_url):
+        url = finder(app)
+        if not url:
+            continue
+        try:
+            path = _download_logo(url)
+        except urllib.error.HTTPError:
+            path = ""
+        if path:
+            return path
+    return ""
+
+
+def _logo_worker():
+    while True:
+        with _logo_lock:
+            # Newest request first: that's what is on screen now
+            app = _logo_pending.pop() if _logo_pending else None
+        if app is None:
+            return
+        try:
+            path = _find_logo(app)
+        except Exception as e:
+            # Probably offline: guess again next time BUA starts
+            print(f"[BUA] No logo for {app} yet: {e}")
+            continue
+        with _logo_lock:
+            _logo_index[app] = path
+        _save_logo_index()
+
+
+def app_logo(app: str, box: Tuple[int, int]):
+    """The app's logo scaled to fit a box (w, h), or None while it is
+    unknown, downloading, or missing."""
+    global _logo_thread
+    if not _logo_loaded:
+        _load_logo_index()
+    path = _logo_index.get(app)
+    if path is None:
+        if app not in _logo_requested:
+            _logo_requested.add(app)
+            with _logo_lock:
+                _logo_pending.append(app)
+            if _logo_thread is None or not _logo_thread.is_alive():
+                _logo_thread = threading.Thread(target=_logo_worker, daemon=True)
+                _logo_thread.start()
+        return None
+    if not path:
+        return None
+    key = (app, box)
+    if key not in _logo_surfaces:
+        try:
+            img = pygame.image.load(path).convert_alpha()
+            scale = min(box[0] / img.get_width(), box[1] / img.get_height())
+            _logo_surfaces[key] = pygame.transform.smoothscale(
+                img, (max(1, int(img.get_width() * scale)), max(1, int(img.get_height() * scale))))
+        except Exception:
+            _logo_surfaces[key] = None
+    return _logo_surfaces[key]
+
+
+def draw_app_icon(surf, rect, key: str, font, align_left: bool = False):
+    """The app's logo on a dark rounded panel filling rect, or, until a logo
+    is found, its monogram as a square (centred, or at the left of rect)."""
+    side = min(rect.w, rect.h)
+    pad = max(4, side // 10)
+    logo = app_logo(key, (rect.w - 2 * pad, rect.h - 2 * pad))
+    if logo is None:
+        square = pygame.Rect(0, 0, side, side)
+        if align_left:
+            square.midleft = rect.midleft
+        else:
+            square.center = rect.center
+        draw_monogram(surf, square, key, font)
+        return
+    pygame.draw.rect(surf, (16, 22, 30), rect, border_radius=max(4, side // 5))
+    surf.blit(logo, logo.get_rect(center=rect.center))
+
+
 def draw_check_badge(surf, center, radius: int, fill):
     """A filled circle with a white tick, for installed or selected apps."""
     pygame.draw.circle(surf, fill, center, radius)
@@ -2022,8 +2258,8 @@ def draw_app_row(rect, key: str, selected: bool, checked: bool = False, installe
     f = UI_FONTS
     draw_tile(screen, rect, selected, radius=S(12))
     mono = rect.h - S(16)
-    mono_rect = pygame.Rect(rect.x + S(8), rect.y + S(8), mono, mono)
-    draw_monogram(screen, mono_rect, key, f["monogram_small"])
+    mono_rect = pygame.Rect(rect.x + S(8), rect.y + S(8), int(mono * 1.6), mono)
+    draw_app_icon(screen, mono_rect, key, f["monogram_small"], align_left=True)
     x = mono_rect.right + S(16)
     badge_r = S(11)
     right = rect.right - S(16)
@@ -2080,9 +2316,8 @@ def draw_app_tile(surf, rect, key: str, selected: bool, checked: bool, installed
         rect = rect.inflate(S(10), S(10))
     draw_tile(surf, rect, selected)
     mono = max(S(32), min(rect.w - S(48), rect.h - f["body"].get_height() - S(48)))
-    mono_rect = pygame.Rect(0, 0, mono, mono)
-    mono_rect.midtop = (rect.centerx, rect.y + S(18))
-    draw_monogram(surf, mono_rect, key, f["monogram"])
+    mono_rect = pygame.Rect(rect.x + S(14), rect.y + S(18), rect.w - S(28), mono)
+    draw_app_icon(surf, mono_rect, key, f["monogram"])
     name = f["body"].render(fit_text(key, f["body"], rect.w - S(20)), True, FG)
     surf.blit(name, name.get_rect(midtop=(rect.centerx, mono_rect.bottom + S(12))))
     badge_r = S(12)
@@ -2101,8 +2336,8 @@ def draw_app_details(surf, panel, key: str):
     pad = S(24)
     x = panel.x + pad
     inner_w = panel.w - 2 * pad
-    mono = pygame.Rect(x, panel.y + pad, S(88), S(88))
-    draw_monogram(surf, mono, key, f["monogram_big"])
+    mono = pygame.Rect(x, panel.y + pad, inner_w, S(120))
+    draw_app_icon(surf, mono, key, f["monogram_big"], align_left=True)
     y = mono.bottom + S(18)
     for line in wrap(key, inner_w, f["hero"])[:2]:
         draw_text(surf, line, f["hero"], FG, (x, y))
