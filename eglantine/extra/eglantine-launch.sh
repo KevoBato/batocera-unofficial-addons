@@ -1,10 +1,18 @@
 #!/bin/bash
 # Launch wrapper for Eglantine (Switch 2), called by the eglantine generator
 # (or batocera-launch emulator on Batocera 44+) with the game's .sw2 folder.
+# With no game, or with the "Eglantine.sw2" entry the installer puts in the
+# Switch 2 list (a file, not a folder), it opens the emulator's own window,
+# for keys, firmware, controllers and settings. F1 > Applications uses that too.
 
 install_dir="/userdata/system/add-ons/eglantine"
 log_file="/userdata/system/logs/eglantine.log"
 qt_config="/userdata/system/.config/eden/qt-config.ini"
+
+# Auto-detect the X display (it can be :0 or :1 depending on how X started)
+[ -n "$DISPLAY" ] || export DISPLAY=:$(ls /tmp/.X11-unix | head -n1 | tr -dc 0-9).0
+export QT_QPA_PLATFORM=xcb
+unset WAYLAND_DISPLAY
 
 # Hotkey+Start sends Alt+F4, which the emulator answers with "Are you sure
 # you want to close?" unless it is told never to ask (confirmStop: 0 always
@@ -18,14 +26,18 @@ elif grep -q '^\[UI\]$' "$qt_config"; then
     sed -i 's/^\[UI\]$/[UI]\nconfirmStop\\default=false\nconfirmStop=2/' "$qt_config"
 fi
 
-# Auto-detect the X display (it can be :0 or :1 depending on how X started)
-[ -n "$DISPLAY" ] || export DISPLAY=:$(ls /tmp/.X11-unix | head -n1 | tr -dc 0-9).0
-export QT_QPA_PLATFORM=xcb
-unset WAYLAND_DISPLAY
+# The last argument is the game; with no arguments ${@: -1} would be $0
+target=""
+[ $# -gt 0 ] && target="${@: -1}"
+
+# The emulator's window: put back its own settings (no game's ES choices)
+if [ -z "$target" ] || { [ -f "$target" ] && [ "${target##*.}" = "sw2" ]; }; then
+    python3 "$install_dir/eglantine-settings.py" > "$log_file" 2>&1
+    exec "$install_dir/eglantine.AppImage" >> "$log_file" 2>&1
+fi
 
 # A Switch 2 dump is a folder (base/exefs/main, base/romfs, ...); the
 # emulator wants its exefs/main file
-target="${@: -1}"
 game="$target"
 if [ -d "$target" ]; then
     game=""
@@ -42,5 +54,8 @@ if [ ! -f "$game" ]; then
     exit 1
 fi
 
+# The settings chosen for this game (or the system) in EmulationStation
+python3 "$install_dir/eglantine-settings.py" "$target" > "$log_file" 2>&1
+
 # exec keeps the emulator in the foreground so the launcher waits for it
-exec "$install_dir/eglantine.AppImage" -f -g "$game" > "$log_file" 2>&1
+exec "$install_dir/eglantine.AppImage" -f -g "$game" >> "$log_file" 2>&1

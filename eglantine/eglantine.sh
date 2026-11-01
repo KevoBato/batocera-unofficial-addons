@@ -2,7 +2,9 @@
 # Installer for Eglantine, an experimental Switch 2 emulator (the PokeDinner
 # fork of Eden). Installs the latest Linux AppImage to
 # /userdata/system/add-ons/eglantine and adds a Nintendo Switch 2 system to
-# EmulationStation (Hotkey+Start exits).
+# EmulationStation (Hotkey+Start exits), with the emulator's main settings in
+# ES's per-game and system settings. The emulator's own window opens from the
+# "Eglantine (emulator)" entry in that list and from F1 > Applications.
 # Games go in /userdata/roms/switch2, one folder per game named "<Game>.sw2"
 # holding the dump (base/exefs/main, base/romfs, ...).
 # Batocera 44 replaced configgen/emulatorlauncher with batocera-launch, which
@@ -111,17 +113,79 @@ else
 fi
 wget -q --show-progress -O "$install_dir/eglantine-launch.sh" "$base_url/extra/eglantine-launch.sh" \
     || fail "Failed to download the launch wrapper."
-chmod +x "$install_dir/eglantine-launch.sh"
+wget -q --show-progress -O "$install_dir/eglantine-settings.py" "$base_url/extra/eglantine-settings.py" \
+    || fail "Failed to download the settings helper."
+chmod +x "$install_dir/eglantine-launch.sh" "$install_dir/eglantine-settings.py"
 
-# Download and deploy ES system
+# The emulator's icon, for F1 > Applications and the Switch 2 list
+icon_tmp=$(mktemp -d)
+(cd "$icon_tmp" && "$install_dir/eglantine.AppImage" --appimage-extract eglantine.png >/dev/null 2>&1)
+cp -f "$icon_tmp/squashfs-root/eglantine.png" "$install_dir/eglantine.png" 2>/dev/null
+rm -rf "$icon_tmp"
+
+# Download and deploy ES system, and the per-game settings shown in ES
 echo "Downloading ES config..."
 mkdir -p "$es_config_dir"
 # The ROM folder may be a link to another drive, which can be unplugged
 [ -L "$rom_dir" ] || mkdir -p "$rom_dir"
 wget -q --show-progress -O "$es_config_dir/es_systems_switch2.cfg" "$base_url/extra/es_systems_switch2.cfg"
+wget -q --show-progress -O "$es_config_dir/es_features_switch2.cfg" "$base_url/extra/es_features_switch2.cfg"
 if [ "$launcher" = "batocera-launch" ]; then
     sed -i 's|<command>emulatorlauncher |<command>batocera-launch |' "$es_config_dir/es_systems_switch2.cfg"
 fi
+
+# An entry in the Switch 2 list that opens the emulator's own window. It is a
+# file, not a folder like the games, so eglantine-launch.sh knows it apart.
+if [ -d "$rom_dir" ]; then
+    gamelist="$rom_dir/gamelist.xml"
+    echo "Opens the Eglantine emulator itself, for keys, firmware, controllers and settings." > "$rom_dir/Eglantine.sw2"
+    mkdir -p "$rom_dir/images"
+    [ -f "$install_dir/eglantine.png" ] && cp -f "$install_dir/eglantine.png" "$rom_dir/images/eglantine.png"
+    if [ ! -f "$gamelist" ]; then
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<gameList>\n</gameList>\n' > "$gamelist"
+    fi
+    xmlstarlet ed -d "/gameList/game[path='./Eglantine.sw2']" \
+      -s "/gameList" -t elem -n "game" -v "" \
+      -s "/gameList/game[last()]" -t elem -n "path" -v "./Eglantine.sw2" \
+      -s "/gameList/game[last()]" -t elem -n "name" -v "Eglantine (emulator)" \
+      -s "/gameList/game[last()]" -t elem -n "desc" -v "Opens the Eglantine emulator itself, to set up keys, firmware, controllers and its own settings." \
+      -s "/gameList/game[last()]" -t elem -n "image" -v "./images/eglantine.png" \
+      "$gamelist" > "$gamelist.tmp" && mv "$gamelist.tmp" "$gamelist"
+fi
+
+# F1 > Applications entry. /usr/share/applications is reset at boot, so a copy
+# is kept in /userdata and put back by custom.sh.
+echo "Creating desktop entry..."
+desktop_file="/usr/share/applications/Eglantine.desktop"
+persistent_desktop="/userdata/system/configs/eglantine/Eglantine.desktop"
+restore_script="/userdata/system/configs/eglantine/restore_desktop_entry.sh"
+mkdir -p /userdata/system/configs/eglantine
+cat > "$persistent_desktop" <<DESKTOP
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Eglantine (Switch 2)
+Exec=$install_dir/eglantine-launch.sh
+Icon=$install_dir/eglantine.png
+Terminal=false
+Categories=Game;batocera.linux;
+DESKTOP
+chmod +x "$persistent_desktop"
+cp -f "$persistent_desktop" "$desktop_file"
+chmod +x "$desktop_file"
+cat > "$restore_script" <<RESTORE
+#!/bin/bash
+if [ ! -f "$desktop_file" ]; then
+    cp "$persistent_desktop" "$desktop_file"
+    chmod +x "$desktop_file"
+fi
+RESTORE
+chmod +x "$restore_script"
+touch /userdata/system/custom.sh
+if ! grep -q "$restore_script" /userdata/system/custom.sh; then
+    echo "bash \"$restore_script\" &" >> /userdata/system/custom.sh
+fi
+chmod +x /userdata/system/custom.sh
 if [ -d "$rom_dir" ] && [ ! -e "$rom_dir/_info.txt" ]; then
     cat > "$rom_dir/_info.txt" <<'EOF'
 Nintendo Switch 2 games for Eglantine.
