@@ -63,7 +63,9 @@ python3 "$install_dir/eglantine-settings.py" "$target" > "$log_file" 2>&1
 # below the limit, the emulator is killed and ES comes back.
 # Loading can take over 2 GB a second, so it checks 4 times a second.
 # EGLANTINE_MIN_FREE_MB=<MB> sets the limit (default 10% of RAM, at least 1.5 GB).
-(echo 1000 > /proc/self/oom_score_adj; exec "$install_dir/eglantine.AppImage" -f -g "$game") >> "$log_file" 2>&1 &
+# setsid gives the AppImage and the emulator it starts their own process
+# group, so the watchdog can kill them all whatever the emulator is called.
+(echo 1000 > /proc/self/oom_score_adj; exec setsid "$install_dir/eglantine.AppImage" -f -g "$game") >> "$log_file" 2>&1 &
 pid=$!
 renice -n -10 $$ >/dev/null 2>&1
 
@@ -82,9 +84,7 @@ while kill -0 "$pid" 2>/dev/null; do
     done < /proc/meminfo
     if [ -n "$available_mb" ] && [ "$available_mb" -lt "$min_free_mb" ]; then
         echo "[eglantine] only ${available_mb} MB of memory left, closing the emulator before the machine freezes" >> "$log_file"
-        # The AppImage runs the emulator as a child process named eglantine
-        pkill -9 -x eglantine
-        kill -9 "$pid" 2>/dev/null
+        kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
         break
     fi
     sleep 0.25
