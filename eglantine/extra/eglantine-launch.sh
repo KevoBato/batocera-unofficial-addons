@@ -57,5 +57,36 @@ fi
 # The settings chosen for this game (or the system) in EmulationStation
 python3 "$install_dir/eglantine-settings.py" "$target" > "$log_file" 2>&1
 
-# exec keeps the emulator in the foreground so the launcher waits for it
-exec "$install_dir/eglantine.AppImage" -f -g "$game" >> "$log_file" 2>&1
+# Some games make the emulator use up all the RAM, which freezes the whole
+# machine (no keyboard, no SSH) long before Linux steps in. Start it marked as
+# the first thing to kill when memory runs out, and watch the free memory:
+# below the limit, the emulator is killed and ES comes back.
+# Loading can take over 2 GB a second, so it checks 4 times a second.
+# EGLANTINE_MIN_FREE_MB=<MB> sets the limit (default 10% of RAM, at least 1.5 GB).
+(echo 1000 > /proc/self/oom_score_adj; exec "$install_dir/eglantine.AppImage" -f -g "$game") >> "$log_file" 2>&1 &
+pid=$!
+renice -n -10 $$ >/dev/null 2>&1
+
+total_mb=0
+while read -r name value unit; do
+    [ "$name" = "MemTotal:" ] && total_mb=$((value / 1024)) && break
+done < /proc/meminfo
+min_free_mb=${EGLANTINE_MIN_FREE_MB:-$((total_mb / 10))}
+[ -n "$EGLANTINE_MIN_FREE_MB" ] || [ "$min_free_mb" -ge 1536 ] || min_free_mb=1536
+echo "[eglantine] memory watchdog: ${total_mb} MB RAM, kills the emulator below ${min_free_mb} MB free" >> "$log_file"
+
+while kill -0 "$pid" 2>/dev/null; do
+    available_mb=""
+    while read -r name value unit; do
+        [ "$name" = "MemAvailable:" ] && available_mb=$((value / 1024)) && break
+    done < /proc/meminfo
+    if [ -n "$available_mb" ] && [ "$available_mb" -lt "$min_free_mb" ]; then
+        echo "[eglantine] only ${available_mb} MB of memory left, closing the emulator before the machine freezes" >> "$log_file"
+        # The AppImage runs the emulator as a child process named eglantine
+        pkill -9 -x eglantine
+        kill -9 "$pid" 2>/dev/null
+        break
+    fi
+    sleep 0.25
+done
+wait "$pid"
