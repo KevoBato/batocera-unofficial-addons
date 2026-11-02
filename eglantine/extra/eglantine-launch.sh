@@ -57,6 +57,27 @@ fi
 # The settings chosen for this game (or the system) in EmulationStation
 python3 "$install_dir/eglantine-settings.py" "$target" > "$log_file" 2>&1
 
+total_mb=0
+while read -r name value unit; do
+    [ "$name" = "MemTotal:" ] && total_mb=$((value / 1024)) && break
+done < /proc/meminfo
+
+# Batocera has no swap, and Switch 2 games can need more memory than a 16 GB
+# machine with built-in graphics has (Mario Kart World only reaches its title
+# screen with it). Without other swap, add compressed swap in RAM (zram, half
+# the RAM; game memory compresses about 5 to 1) for as long as the game runs.
+zram_added=""
+swap_total=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
+if [ "${swap_total:-0}" -eq 0 ] && { [ -e /sys/block/zram0 ] || modprobe zram 2>/dev/null; } \
+    && [ "$(cat /sys/block/zram0/disksize 2>/dev/null)" = "0" ] \
+    && echo "$((total_mb / 2))M" > /sys/block/zram0/disksize \
+    && mkswap /dev/zram0 >/dev/null 2>&1 && swapon -p 100 /dev/zram0; then
+    zram_added=1
+    swappiness=$(cat /proc/sys/vm/swappiness)
+    echo 100 > /proc/sys/vm/swappiness
+    echo "[eglantine] added $((total_mb / 2)) MB of compressed swap (zram)" >> "$log_file"
+fi
+
 # Some games make the emulator use up all the RAM, which freezes the whole
 # machine (no keyboard, no SSH) long before Linux steps in. Start it marked as
 # the first thing to kill when memory runs out, and watch the free memory:
@@ -69,19 +90,22 @@ python3 "$install_dir/eglantine-settings.py" "$target" > "$log_file" 2>&1
 pid=$!
 renice -n -10 $$ >/dev/null 2>&1
 
-total_mb=0
-while read -r name value unit; do
-    [ "$name" = "MemTotal:" ] && total_mb=$((value / 1024)) && break
-done < /proc/meminfo
 min_free_mb=${EGLANTINE_MIN_FREE_MB:-$((total_mb / 10))}
 [ -n "$EGLANTINE_MIN_FREE_MB" ] || [ "$min_free_mb" -ge 1536 ] || min_free_mb=1536
 echo "[eglantine] memory watchdog: ${total_mb} MB RAM, kills the emulator below ${min_free_mb} MB free" >> "$log_file"
 
 while kill -0 "$pid" 2>/dev/null; do
+    # Free swap (a swapfile or zram) counts too: the kernel can still move
+    # memory there
     available_mb=""
+    swap_free_mb=0
     while read -r name value unit; do
-        [ "$name" = "MemAvailable:" ] && available_mb=$((value / 1024)) && break
+        case "$name" in
+            MemAvailable:) available_mb=$((value / 1024)) ;;
+            SwapFree:) swap_free_mb=$((value / 1024)); break ;;
+        esac
     done < /proc/meminfo
+    [ -n "$available_mb" ] && available_mb=$((available_mb + swap_free_mb))
     if [ -n "$available_mb" ] && [ "$available_mb" -lt "$min_free_mb" ]; then
         echo "[eglantine] only ${available_mb} MB of memory left, closing the emulator before the machine freezes" >> "$log_file"
         kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
@@ -90,3 +114,10 @@ while kill -0 "$pid" 2>/dev/null; do
     sleep 0.25
 done
 wait "$pid"
+status=$?
+
+if [ -n "$zram_added" ]; then
+    swapoff /dev/zram0 && echo 1 > /sys/block/zram0/reset
+    echo "$swappiness" > /proc/sys/vm/swappiness
+fi
+exit $status
