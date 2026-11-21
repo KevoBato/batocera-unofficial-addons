@@ -5029,15 +5029,19 @@ def _build_feature_row(core: UICore, feat) -> Gtk.EventBox:
             if hasattr(item, '_tab_target') and hasattr(row, '_tabs'):
                 item.set_active(True)
 
+        # Skip items that are not shown, e.g. the Game and Gun tabs when no
+        # game is running (L1/R1 already skip them in set_next_tab)
         def on_left():
-            current_idx = getattr(row, '_item_index', 0)
-            new_idx = current_idx - 1
+            new_idx = getattr(row, '_item_index', 0) - 1
+            while new_idx >= 0 and not core._is_widget_shown(row._items[new_idx]):
+                new_idx -= 1
             if new_idx >= 0:
                 _set_item_focus(new_idx)
 
         def on_right():
-            current_idx = getattr(row, '_item_index', 0)
-            new_idx = current_idx + 1
+            new_idx = getattr(row, '_item_index', 0) + 1
+            while new_idx < len(row._items) and not core._is_widget_shown(row._items[new_idx]):
+                new_idx += 1
             if new_idx < len(row._items):
                 _set_item_focus(new_idx)
 
