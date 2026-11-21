@@ -1,6 +1,6 @@
 #!/bin/bash
 # Installer for Modern Control Center: a modern look for Batocera's Control
-# Center (Hotkey+A): icons, quick-settings tiles, a translucent rounded
+# Center (Hotkey + east face button): icons, quick-settings tiles, a translucent rounded
 # panel (on Batocera's Wayland desktop), soft cards, pill tabs and a clear
 # glowing highlight for controller navigation.
 #
@@ -45,7 +45,7 @@ bash "$service_file" stop >/dev/null 2>&1
 bash "$service_file" start || fail "Could not start $APPNAME."
 
 echo ""
-echo "$APPNAME is installed. Press Hotkey+A to open the Control Center."
+echo "$APPNAME is installed. Press Hotkey + the east (right) face button (B on Xbox-style controllers) to open the Control Center."
 # Your own Control Center files win over any theme: say so if they exist
 for f in controlcenter.xml style.css; do
     if [ -f "$user_configs/$f" ]; then

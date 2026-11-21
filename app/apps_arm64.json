@@ -1,5 +1,5 @@
 {
-  "changelog": "- Added Modern Control Center - icons, quick tiles and a translucent panel for Batocera's Control Center (Hotkey+A)\n- Added iso2zar - GUI tool to convert Xbox[360] .iso images directly into .zar format\n- Added chdress - GUI tool to convert any disc image to/from CHD format\n- Added npsget - Helper to download games, DLCs, updates, themes and avatars from NoPayStation\n- Added Prism Launcher - open source Minecraft launcher with mod management and multi-instance support\n- Added Jellyfin Player - native media player client with controller support",
+  "changelog": "- Added Modern Control Center - icons, quick tiles and a translucent panel for Batocera's Control Center (Hotkey + east face button)\n- Added iso2zar - GUI tool to convert Xbox[360] .iso images directly into .zar format\n- Added chdress - GUI tool to convert any disc image to/from CHD format\n- Added npsget - Helper to download games, DLCs, updates, themes and avatars from NoPayStation\n- Added Prism Launcher - open source Minecraft launcher with mod management and multi-instance support\n- Added Jellyfin Player - native media player client with controller support",
   "apps": [
     {
       "name": "Alpine XFCE (Webtop)",
@@ -219,7 +219,7 @@
     },
     {
       "name": "Modern Control Center",
-      "description": "A modern look for Batocera's Control Center (Hotkey+A): icons, quick-settings tiles, a translucent panel and a clear highlight for controllers. Batocera 43+.",
+      "description": "A modern look for Batocera's Control Center (Hotkey + east face button): icons, quick-settings tiles, a translucent panel and a clear highlight for controllers. Batocera 43+.",
       "categories": [
         "System Utilities"
       ],
