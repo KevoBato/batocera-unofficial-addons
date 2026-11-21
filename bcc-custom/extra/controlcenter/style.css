@@ -1,0 +1,508 @@
+/* Batocera Control Center - "Modern" theme (GTK3 CSS)
+ *
+ * A drop-in replacement for style.css: same classes and size presets,
+ * new look. Cards instead of outlined boxes, a pill segmented control for
+ * tabs, soft buttons that light up with a blue-cyan gradient and glow when
+ * selected (easy to see from the couch), red-tinted buttons for
+ * destructive actions, iOS-style switches and slim gradient bars.
+ *
+ * Try it without changing Batocera:
+ *   cp style.css /userdata/system/configs/controlcenter/style.css
+ * (BCC loads that file instead of its default; delete it to go back.)
+ */
+
+/* ---------- Palette ----------------------------------------------------
+ * bg      #0b0e14 .. #121620   window
+ * card    #161b26              sections
+ * raised  rgba(255,255,255,.06) controls
+ * text    #eef1f7 / muted #8b93a7
+ * accent  #2f7bff -> #00c2ff   (Batocera blue to cyan)
+ * danger  #ff5d6c
+ * ---------------------------------------------------------------------- */
+
+/* Size presets (font) */
+.scale-small * { font-size: 10px; }
+.scale-medium * { font-size: 14px; }
+.scale-full * { font-size: 16px; }
+.scale-large * { font-size: 24px; }
+.scale-xlarge * { font-size: 32px; }
+
+* {
+  font-family: "Noto Sans", "DejaVu Sans", sans-serif;
+  transition: background-color 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+              border-color 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+              box-shadow 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+              color 180ms ease-out;
+}
+
+/* ---------- Window ---------- */
+.popup-root {
+  background-color: #0b0e14;
+  background-image: linear-gradient(165deg, #141a26 0%, #0b0e14 55%, #090b10 100%);
+  color: #eef1f7;
+}
+
+.cc-outer { padding: 14px 18px; }
+.scale-small .cc-outer, .scale-medium .cc-outer { padding: 6px 8px; }
+
+/* ---------- Text ---------- */
+.header, .item-text { color: #eef1f7; }
+.item-text { font-weight: 500; }
+.value { color: #7cc4ff; font-weight: 600; }
+
+/* ---------- Section cards (hgroup frames) ---------- */
+frame { border: none; background: none; box-shadow: none; }
+
+frame > border {
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 18px;
+  padding: 10px 14px;
+  background-color: #161b26;
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0));
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.05);
+}
+.scale-small frame > border, .scale-medium frame > border {
+  border-radius: 10px;
+  padding: 4px 6px;
+}
+
+/* Section heading: small, spaced, accent coloured (no box) */
+.group-title {
+  color: #7cc4ff;
+  background-color: transparent;
+  font-weight: 700;
+  letter-spacing: 1.6px;
+  padding: 2px 6px 8px 4px;
+}
+.scale-small .group-title, .scale-medium .group-title {
+  letter-spacing: 1px;
+  padding: 1px 3px 3px 2px;
+}
+
+.group-frame {
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 18px;
+  margin: 12px 0;
+  padding: 10px;
+  background-color: #161b26;
+}
+.scale-small .group-frame, .scale-medium .group-frame {
+  border-radius: 10px;
+  margin: 3px 0;
+  padding: 4px;
+}
+
+/* ---------- Rows and cells ---------- */
+.vgroup-row { padding: 4px 0; }
+.scale-small .vgroup-row, .scale-medium .vgroup-row { padding: 2px 0; }
+
+.vgroup-cell {
+  background-color: rgba(255, 255, 255, 0.025);
+  border-radius: 12px;
+  padding: 8px 12px;
+  margin: 0 8px;
+  min-height: 50px;
+}
+.scale-small .vgroup-cell, .scale-medium .vgroup-cell {
+  border-radius: 6px;
+  padding: 3px 5px;
+  margin: 0 3px;
+  min-height: 20px;
+}
+
+/* Header and footer bars: quiet "status chips" */
+.vgroup-row.footer-row .vgroup-cell { background-color: rgba(255, 255, 255, 0.04); }
+
+.vgroup-cell-first { min-width: 180px; }
+.scale-small .vgroup-cell-first, .scale-medium .vgroup-cell-first { min-width: 60px; }
+.vgroup-row .value { min-width: 200px; }
+.scale-small .vgroup-row .value, .scale-medium .vgroup-row .value { min-width: 80px; }
+.vgroup-row.footer-row .value { min-width: 0; }
+
+.feature-row { min-height: 44px; }
+.scale-small .feature-row, .scale-medium .feature-row { min-height: 32px; }
+
+.section-separator {
+  background-color: transparent;
+  background-image: linear-gradient(90deg, rgba(124, 196, 255, 0), rgba(124, 196, 255, 0.35), rgba(124, 196, 255, 0));
+  min-height: 1px;
+  margin: 14px 0;
+}
+.scale-small .section-separator, .scale-medium .section-separator { margin: 4px 0; }
+
+/* Focused row stays transparent; only controls highlight */
+.focused { background-color: transparent; }
+
+/* ---------- Buttons ---------- */
+button {
+  border-radius: 14px;
+  padding: 9px 18px;
+  min-width: 80px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background-color: rgba(255, 255, 255, 0.06);
+  background-image: none;
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.06);
+  color: #eef1f7;
+}
+.scale-small button, .scale-medium button {
+  border-radius: 8px;
+  padding: 3px 8px;
+  min-width: 40px;
+}
+
+button label {
+  color: #eef1f7;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+button.cc-button,
+button.cc-choice,
+button.choice-option {
+  background-color: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+button.cc-button:hover,
+button.cc-choice:hover,
+button.choice-option:hover {
+  background-color: rgba(255, 255, 255, 0.11);
+  border-color: rgba(124, 196, 255, 0.35);
+}
+
+/* Selected / focused: accent gradient + glow (the main "you are here") */
+button.cc-button.choice-selected,
+button.cc-button.focused-cell,
+button.cc-button:focus,
+button.cc-choice.choice-selected,
+button.choice-option.choice-selected,
+button.focused-cell {
+  background-color: #2f7bff;
+  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+  border-color: rgba(255, 255, 255, 0.35);
+  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.28), 0 6px 18px rgba(0, 120, 255, 0.45);
+  color: #ffffff;
+}
+button.cc-button.choice-selected label,
+button.cc-button.focused-cell label,
+button.cc-button:focus label,
+button.cc-choice.choice-selected label,
+button.choice-option.choice-selected label,
+button.focused-cell label {
+  color: #ffffff;
+}
+
+/* Destructive actions (button_confirm: Quit game, Kill it!) */
+button.cc-button.cc-button-confirm {
+  background-color: rgba(255, 93, 108, 0.12);
+  border-color: rgba(255, 93, 108, 0.35);
+}
+button.cc-button.cc-button-confirm label { color: #ff9aa4; }
+button.cc-button.cc-button-confirm:hover { background-color: rgba(255, 93, 108, 0.2); }
+button.cc-button.cc-button-confirm.choice-selected,
+button.cc-button.cc-button-confirm.focused-cell,
+button.cc-button.cc-button-confirm:focus {
+  background-color: #ff4d5e;
+  background-image: linear-gradient(135deg, #ff4d5e 0%, #ff7a59 100%);
+  border-color: rgba(255, 255, 255, 0.35);
+  box-shadow: 0 0 0 3px rgba(255, 93, 108, 0.3), 0 6px 18px rgba(255, 77, 94, 0.45);
+}
+button.cc-button.cc-button-confirm.choice-selected label,
+button.cc-button.cc-button-confirm.focused-cell label,
+button.cc-button.cc-button-confirm:focus label {
+  color: #ffffff;
+}
+
+button:disabled,
+button.cc-button:disabled,
+button.cc-choice:disabled,
+button.choice-option:disabled {
+  background-color: rgba(255, 255, 255, 0.02);
+  border-color: rgba(255, 255, 255, 0.04);
+  box-shadow: none;
+  color: #5b6272;
+}
+
+/* Old-style toggle buttons */
+button.cc-toggle {
+  background-color: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  padding: 10px 22px;
+  min-width: 80px;
+  color: #8b93a7;
+}
+.scale-small button.cc-toggle, .scale-medium button.cc-toggle { padding: 4px 10px; min-width: 40px; }
+button.cc-toggle:checked {
+  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: #ffffff;
+}
+button.cc-toggle.choice-selected,
+button.cc-toggle.focused-cell,
+button.cc-toggle:focus {
+  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.35);
+  border-color: #7cc4ff;
+}
+
+/* ---------- Tabs: pill segmented control ---------- */
+button.cc-tab {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 9px 26px;
+  min-width: 120px;
+  margin: 0 3px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+.scale-small button.cc-tab, .scale-medium button.cc-tab {
+  padding: 3px 12px;
+  min-width: 60px;
+  margin: 0 2px;
+}
+button.cc-tab label { color: #8b93a7; font-weight: 600; }
+button.cc-tab:hover { background-color: rgba(255, 255, 255, 0.06); }
+button.cc-tab:hover label { color: #c9cfdc; }
+
+button.cc-tab:checked {
+  background-color: rgba(47, 123, 255, 0.18);
+  border-color: rgba(124, 196, 255, 0.45);
+  margin-bottom: 0;
+}
+button.cc-tab:checked label { color: #ffffff; font-weight: 700; }
+
+button.cc-tab:checked.choice-selected,
+button.cc-tab:checked.focused-cell,
+button.cc-tab.focused-cell {
+  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+  border-color: rgba(255, 255, 255, 0.35);
+  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.28), 0 6px 18px rgba(0, 120, 255, 0.4);
+}
+button.cc-tab.focused-cell label { color: #ffffff; }
+
+/* ---------- Choice popups and confirm dialogs ---------- */
+.choice-selected {
+  background-color: rgba(47, 123, 255, 0.25);
+  border-color: #7cc4ff;
+  color: #ffffff;
+}
+
+.confirm-dialog {
+  border: 1px solid rgba(124, 196, 255, 0.35);
+  border-radius: 20px;
+  background-color: #121620;
+  background-image: linear-gradient(165deg, #1a2130 0%, #11151e 100%);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+}
+
+button.choice-option {
+  border-radius: 12px;
+  padding: 10px 18px;
+  margin: 3px 0;
+}
+
+.dialog-action-area,
+dialog .dialog-action-area,
+.confirm-dialog .dialog-action-area {
+  min-height: 0px;
+  padding: 0px;
+  margin: 0px;
+  border: none;
+  background: transparent;
+  opacity: 0;
+}
+
+/* ---------- Switches (iOS style) ---------- */
+.cc-switch {
+  background-color: #2a3040;
+  background-image: none;
+  border: 2px solid transparent;  /* constant width: no layout shift */
+  border-radius: 999px;
+  min-width: 52px;
+  min-height: 28px;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.45);
+}
+.scale-small .cc-switch, .scale-medium .cc-switch { min-width: 34px; min-height: 18px; }
+
+.cc-switch:checked {
+  background-color: #2f7bff;
+  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+}
+
+.cc-switch > slider {
+  background-color: #ffffff;
+  background-image: none;
+  border: none;
+  border-radius: 999px;
+  min-width: 24px;
+  min-height: 24px;
+  margin: 2px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+}
+.scale-small .cc-switch > slider, .scale-medium .cc-switch > slider { min-width: 14px; min-height: 14px; }
+
+/* Selected switch: same glow ring as buttons */
+.cc-switch.choice-selected,
+.cc-switch.focused-cell,
+.cc-switch:focus {
+  border-color: #ffffff;
+  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.35), 0 6px 16px rgba(0, 120, 255, 0.4);
+}
+
+/* ---------- Progress bars ---------- */
+.cc-progressbar {
+  min-width: 150px;
+  min-height: 12px;
+  background-color: transparent;
+  border: none;
+  border-radius: 999px;
+  padding: 0;
+}
+.scale-small .cc-progressbar, .scale-medium .cc-progressbar { min-width: 80px; min-height: 8px; }
+
+.cc-progressbar > trough {
+  background-color: rgba(255, 255, 255, 0.07);
+  border-radius: 999px;
+  border: none;
+  min-height: 10px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+.scale-small .cc-progressbar > trough, .scale-medium .cc-progressbar > trough { min-width: 60px; min-height: 6px; }
+
+.cc-progressbar > trough > progress {
+  background-color: #2f7bff;
+  background-image: linear-gradient(90deg, #2f7bff 0%, #00c2ff 100%);
+  border-radius: 999px;
+  border: none;
+  min-height: 10px;
+  box-shadow: 0 0 10px rgba(0, 194, 255, 0.45);
+}
+.scale-small .cc-progressbar > trough > progress,
+.scale-medium .cc-progressbar > trough > progress { min-height: 6px; }
+
+.cc-progressbar-text { color: #eef1f7; font-weight: 700; }
+.feature-row .cc-progressbar-text { margin-bottom: 4px; }
+.scale-small .feature-row .cc-progressbar-text { font-size: 9px; margin-bottom: 2px; }
+.scale-medium .feature-row .cc-progressbar-text { font-size: 13px; }
+.scale-full .feature-row .cc-progressbar-text { font-size: 15px; }
+.scale-large .feature-row .cc-progressbar-text { font-size: 22px; }
+
+/* ---------- Document viewer ---------- */
+.doc-viewer-text {
+  background-color: #0b0e14;
+  color: #eef1f7;
+  font-family: monospace;
+  font-size: 14pt;
+  padding: 20px;
+}
+.scale-small .doc-viewer-text { font-size: 8pt; padding: 10px; }
+.scale-medium .doc-viewer-text { font-size: 14pt; padding: 15px; }
+.scale-large .doc-viewer-text { font-size: 22px; padding: 30px; }
+.doc-viewer-text text { background-color: #0b0e14; color: #eef1f7; }
+
+/* ---------- 4K (extra large) ---------- */
+.scale-xlarge .group-title { padding: 4px 12px 16px 8px; letter-spacing: 3px; }
+.scale-xlarge frame > border { padding: 20px 28px; border-radius: 36px; }
+.scale-xlarge .vgroup-row { padding: 8px 0; }
+.scale-xlarge .vgroup-cell { padding: 16px 24px; margin: 0 16px; min-height: 100px; border-radius: 24px; }
+.scale-xlarge .vgroup-cell-first { min-width: 360px; }
+.scale-xlarge .vgroup-row .value { min-width: 400px; }
+.scale-xlarge .vgroup-row.footer-row .value { min-width: 0; }
+.scale-xlarge .feature-row { min-height: 88px; }
+.scale-xlarge .section-separator { margin: 28px 0; min-height: 2px; }
+.scale-xlarge .cc-outer { padding: 28px 36px; }
+.scale-xlarge .group-frame { border-radius: 36px; margin: 24px 0; padding: 20px; }
+.scale-xlarge button { border-radius: 28px; padding: 18px 36px; min-width: 160px; }
+.scale-xlarge button.cc-toggle { padding: 20px 44px; min-width: 160px; }
+.scale-xlarge button.cc-tab { padding: 18px 52px; min-width: 240px; margin: 0 6px; }
+.scale-xlarge .doc-viewer-text { font-size: 28px; padding: 40px; }
+.scale-xlarge .cc-progressbar { min-width: 300px; min-height: 24px; }
+.scale-xlarge .cc-progressbar > trough { min-width: 300px; min-height: 20px; }
+.scale-xlarge .cc-progressbar > trough > progress { min-height: 20px; }
+.scale-xlarge .feature-row .cc-progressbar-text { font-size: 30px; margin-bottom: 8px; }
+.scale-xlarge .cc-switch { min-width: 104px; min-height: 56px; }
+.scale-xlarge .cc-switch > slider { min-width: 48px; min-height: 48px; margin: 4px; }
+
+/* ======================================================================
+ * Additions for the modern-ui code (icons, quick tiles, translucency).
+ * Harmless on the stock Control Center: these classes just never appear.
+ * ====================================================================== */
+
+/* ---------- Translucent rounded panel ----------
+ * The window gets "cc-translucent" only where the screen can show alpha
+ * (Wayland/labwc, X11 with a compositor). The window itself goes clear and
+ * the panel inside it (cc-outer) is tinted see-through with round corners.
+ * GTK3 cannot blur what is behind it, so it is tinted, not frosted. */
+.popup-root.cc-translucent {
+  background-color: transparent;
+  background-image: none;
+}
+.popup-root.cc-translucent .cc-outer {
+  background-color: rgba(13, 17, 26, 0.86);
+  background-image: linear-gradient(165deg, rgba(26, 33, 48, 0.88) 0%, rgba(11, 14, 20, 0.9) 60%);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 28px;
+}
+.scale-small .popup-root.cc-translucent .cc-outer,
+.scale-medium .popup-root.cc-translucent .cc-outer,
+.popup-root.cc-translucent.scale-small .cc-outer,
+.popup-root.cc-translucent.scale-medium .cc-outer { border-radius: 14px; }
+.popup-root.cc-translucent.scale-xlarge .cc-outer { border-radius: 56px; }
+
+/* ---------- Icons ---------- */
+.cc-icon { color: inherit; }
+button.cc-has-icon { padding-left: 16px; padding-right: 16px; }
+.scale-small button.cc-has-icon, .scale-medium button.cc-has-icon { padding-left: 6px; padding-right: 6px; }
+/* Icon-only buttons (volume - / +): square-ish */
+button.cc-has-icon.cc-button { min-width: 52px; min-height: 44px; }
+.scale-small button.cc-has-icon.cc-button,
+.scale-medium button.cc-has-icon.cc-button { min-width: 28px; min-height: 24px; }
+button.cc-tab.cc-has-icon { padding-left: 22px; padding-right: 24px; }
+
+/* ---------- Quick tiles (<toggle style="tile">) ---------- */
+button.cc-toggle.cc-tile {
+  min-width: 190px;
+  min-height: 112px;
+  padding: 16px 18px;
+  border-radius: 22px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background-color: rgba(255, 255, 255, 0.06);
+  background-image: none;
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.06);
+  color: #eef1f7;
+}
+.scale-small button.cc-toggle.cc-tile,
+.scale-medium button.cc-toggle.cc-tile {
+  min-width: 96px;
+  min-height: 56px;
+  padding: 6px 8px;
+  border-radius: 12px;
+}
+.scale-xlarge button.cc-toggle.cc-tile {
+  min-width: 380px;
+  min-height: 224px;
+  padding: 32px 36px;
+  border-radius: 44px;
+}
+button.cc-toggle.cc-tile:hover { background-color: rgba(255, 255, 255, 0.1); }
+
+button.cc-toggle.cc-tile:checked {
+  background-color: #2f7bff;
+  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+  border-color: rgba(255, 255, 255, 0.3);
+  box-shadow: 0 10px 28px rgba(0, 120, 255, 0.4);
+  color: #ffffff;
+}
+
+button.cc-toggle.cc-tile.choice-selected,
+button.cc-toggle.cc-tile.focused-cell,
+button.cc-toggle.cc-tile:focus {
+  border-color: #ffffff;
+  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.4), 0 10px 28px rgba(0, 120, 255, 0.35);
+}
+
+button.cc-tile label { color: inherit; }
+button.cc-tile .cc-tile-name { font-weight: 700; }
+button.cc-tile .cc-tile-state { opacity: 0.75; font-weight: 500; }
+button.cc-tile:checked .cc-tile-state { opacity: 0.9; }

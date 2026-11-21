@@ -1,0 +1,5624 @@
+# ui_core.py - main UI components for the Control Center
+# This file is part of the batocera distribution (https://batocera.org).
+# Copyright (c) 2025-2026 lbrpdx for the Batocera team
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License
+# as published by the Free Software Foundation, version 3.
+#
+# YOU MUST KEEP THIS HEADER AS IT IS
+import os
+import time
+import shlex
+import gi
+gi.require_version('Gtk', '3.0'); gi.require_version('Gdk', '3.0')
+from gi.repository import Gtk, Gdk, GLib, Pango
+from gamepads import GamePads
+from DocViewer import DocViewer
+from log import debug_print, DEBUG
+
+# for wayland
+try:
+    gi.require_version('GtkLayerShell', '0.1')
+    from gi.repository import GtkLayerShell
+except:
+    pass
+
+import locale
+_ = locale.gettext
+
+from shell import settings_get, settings_set, get_output_list, select_monitor
+
+ACTION_DEBOUNCE_MS = 100  # Faster response
+WINDOW_TITLE = "Batocera Control Center"
+
+# Optional evdev for gamepad
+try:
+    from evdev import InputDevice
+    EVDEV_AVAILABLE = True
+except Exception:
+    EVDEV_AVAILABLE = False
+
+from refresh import RefreshTask, ExpandRefreshTask, DEFAULT_REFRESH_SEC, Debouncer, run_off_main_thread
+from shell import run_shell_capture, run_shell_capture_cached, run_shell_capture_set_to_cache, run_shell_capture_lines, run_shell_cache_lookup, normalize_bool_str, get_primary_geometry, expand_command_string, expand_command_string_cached, extract_commands, shell_cache_has_all, warm_shell_cache
+
+# handle_afterclick_before : actions to do before the call
+# handle_afterclick_after  : actions to do after the call
+# the limit is not so well done while in some case, we want the action to be done after (refresh ui after a command)
+# but sometimes, we want the action to be done after (mainly hotkeys commands so that that they applies on the emulator window and not on the bcc)
+# so, a first proposal is to put bcc_close in the _before cause that's the one used for hotkeys, and the others in after. It may be improved.
+def handle_afterclick_before(core: 'UICore', afterclick_attr: str):
+    """Handle afterclick attribute - execute command or special action after main action"""
+    if not afterclick_attr or not afterclick_attr.strip():
+        return
+    
+    afterclick = afterclick_attr.strip()
+    
+    if afterclick == "bcc_close":
+        # Special case: hide BCC window (keep app running in background)
+        # Don't clear any focus - let GTK handle it naturally
+        debug_print("[AFTERCLICK] Hiding window for bcc_close")
+        core.hide()
+        time.sleep(1)
+
+def handle_afterclick_after(core: 'UICore', afterclick_attr: str):
+    """Handle afterclick attribute - execute command or special action after main action"""
+    if not afterclick_attr or not afterclick_attr.strip():
+        return
+    
+    afterclick = afterclick_attr.strip()
+    
+    if afterclick == "bcc_refresh":
+        # Force the UI to re-read all shell commands and toggle visibility
+        GLib.idle_add(core.schedule_recompute_conditionals)
+    elif afterclick == "bcc_rescreen":
+        # Re-apply the saved screen selection and re-layout the window for
+        # the selected monitor's geometry, live (no restart needed).
+        def _rescreen():
+            core._apply_screen_selection()
+            return False
+        GLib.idle_add(_rescreen)
+    elif afterclick.startswith("${") and afterclick.endswith("}"):
+        # Command substitution - execute the command
+        cmd = afterclick[2:-1]  # Remove ${ and }
+        run_off_main_thread(lambda: run_shell_capture(cmd))
+    else:
+        # Direct command
+        run_off_main_thread(lambda: run_shell_capture(afterclick))
+
+# refresh elements from the list update_ids
+def handle_update_ids(core: 'UICore', update_ids: set[str]):
+    """Handle updateids attribute - updates components after main action"""
+    for elem_id in update_ids:
+        if elem_id in core.refreshfunctionsbyids:
+            if elem_id in core.rendered_ids:
+                if "cmd" in core.refreshfunctionsbyids[elem_id]:
+                    val = run_shell_capture_set_to_cache(core.refreshfunctionsbyids[elem_id]["cmd"])
+                    core.refreshfunctionsbyids[elem_id]["function"](val)
+                else:
+                    core.refreshfunctionsbyids[elem_id]["function"]()
+
+def evaluate_if_condition(condition: str, rendered_ids: set[str], force_fresh: bool = False) -> bool:
+    """
+    Evaluate an 'if' condition to determine if an element should be rendered.
+
+    Supported formats:
+    - if="id(some_id)" - True if element with id="some_id" is rendered
+    - if="!id(some_id)" - True if element with id="some_id" is NOT rendered
+    - if="${command}" - True if command returns non-empty string
+
+    force_fresh forces a synchronous re-run of ${command} instead of trusting
+    the cache. Used once when the window is about to become visible: the
+    cache can be arbitrarily stale by then (nothing refreshes it while
+    hidden - the heartbeat that keeps it warm is stopped in hide()), so the
+    non-blocking cache lookup could show a popup with visibly wrong state
+    for a moment before self-healing on the next heartbeat tick.
+
+    Returns True if condition is met, False otherwise.
+    """
+    if not condition:
+        return True
+
+    s = condition.strip()
+    if not s:
+        return True
+
+    # Check for id(xxx) condition
+    if s.startswith("id(") and s.endswith(")"):
+        # no extra strip inside parentheses
+        return s[3:-1] in rendered_ids
+
+    # Check for !id(xxx) condition (negation)
+    if s.startswith("!id(") and s.endswith(")"):
+        return s[4:-1] not in rendered_ids
+
+    # Check for ${command} condition
+    if s.startswith("${") and s.endswith("}"):
+        cmd = s[2:-1].strip()
+        if not cmd:
+            return False
+        if force_fresh:
+            # Bypass the cache entirely (ttl_sec=0 always treats it as
+            # stale) and block briefly for a correct answer; also warms the
+            # cache for the next non-blocking lookup.
+            result = run_shell_capture_cached(cmd, ttl_sec=0)
+        else:
+            # Non-forking cache lookup: never blocks the UI thread on a subprocess.
+            result = run_shell_cache_lookup(cmd)
+        # Treat "null" as empty result (common in shell commands)
+        result_clean = result.strip()
+        if result_clean.lower() == "null":
+            result_clean = ""
+        return bool(result_clean)
+
+    # Unknown format - default to True to avoid hiding content
+    return True
+
+def should_render_element(element, rendered_ids: set[str]) -> bool:
+    """
+    Check if an element should be rendered based on its 'if' attribute.
+    This is only called one-shot at build time (the heartbeat re-evaluates via
+    evaluate_if_condition directly). so ${...} conditions are evaluated with
+    force_fresh=True: a blocking capture that always returns the real value
+    instead of a cold-cache "" that would wrongly hide the element.
+    If an element has a refresh element, always render while the condition could change.
+    """
+    if_condition = element.attrs.get("if", "").strip()
+    refresh = element.attrs.get("refresh", "").strip()
+    if not if_condition or refresh:
+        return True  # No condition = always render
+    
+    result = evaluate_if_condition(if_condition, rendered_ids, force_fresh=True)
+    
+    if DEBUG:
+        element_info = f"{element.kind}"
+        if hasattr(element, 'attrs') and element.attrs.get('display'):
+            element_info += f" '{element.attrs.get('display')}'"
+        debug_print(f"[RENDER] Condition check for {element_info}: '{if_condition}' -> {result}")
+    
+    return result
+
+def register_element_id(element, rendered_ids: set[str], core=None):
+    """Register an element's ID after it has been rendered with content."""
+    element_id = element.attrs.get("id", "").strip()
+    if not element_id:
+        return
+    if element_id in rendered_ids:
+        # Already registered; nothing else to do
+        return
+
+    rendered_ids.add(element_id)
+
+    # Trigger immediate update of conditional widgets
+    if core and hasattr(core, '_conditional_widgets'):
+        for widget, condition in core._conditional_widgets:
+            try:
+                should_show = evaluate_if_condition(condition, rendered_ids)
+                widget.set_visible(should_show)
+                debug_print(f"[REGISTER] {condition} -> {should_show}, IDs={self.rendered_ids}")
+            except Exception as e:
+                pass
+
+def is_cmd(s: str) -> bool:
+    s = (s or "").strip()
+    return s.startswith("${") and s.endswith("}")
+
+def cmd_of(s: str) -> str:
+    s = (s or "").strip()
+    return s[2:-1].strip() if is_cmd(s) else ""
+
+def xmlattr_to_set(idsstr: str) -> str:
+    ids = set()
+    if idsstr:
+        ids = [i.strip() for i in idsstr.strip().split() if i.strip()]
+    return ids
+
+class _SyntheticChoice:
+    """A minimal stand-in for a <choice> CCElement, produced by expanding a
+    <choice_cmd> at popup-open time. Only .kind/.attrs/.line are read by the
+    choice-popup and prewarm code."""
+    __slots__ = ("kind", "attrs", "line")
+    def __init__(self, attrs: dict, line: int = -1):
+        self.kind = "choice"
+        self.attrs = attrs
+        self.line = line
+
+
+def _choice_cache_ttl(elem) -> float:
+    """Shared TTL reader for <choice> and <choice_cmd> (default 5s)."""
+    try:
+        return max(0.0, float((elem.attrs.get("cache") or "5").strip() or "5"))
+    except Exception:
+        return 5.0
+
+
+def expand_choice_cmd(elem) -> list:
+    """
+    Expand a single <choice_cmd> element into a list of synthetic <choice>
+    elements by running its display/action_arg commands.
+
+    - ``display``  : a ${...} command whose stdout lines become option labels.
+    - ``action``   : the base shell command prefixed to every option.
+    - ``action_arg`` (optional): a ${...} command whose stdout lines become the
+      per-option argument appended to ``action`` (quoted with shlex.quote).
+
+    The label and arg lists are zipped positionally; extra lines on either side
+    are ignored. When action_arg is omitted, only the base ``action`` runs.
+    Results are read through the shared TTL cache (cache="N") so repeated
+    opens don't re-spawn the commands.
+
+    Returns a (possibly empty) list of _SyntheticChoice objects.
+    """
+    disp_attr = (elem.attrs.get("display") or "").strip()
+    action = (elem.attrs.get("action") or "").strip()
+    arg_attr = (elem.attrs.get("action_arg") or "").strip()
+    afterclick = (elem.attrs.get("afterclick") or "").strip()
+    ttl = _choice_cache_ttl(elem)
+
+    # Resolve the label command (must be a ${...} command)
+    labels = []
+    if is_cmd(disp_attr):
+        labels = run_shell_capture_lines(cmd_of(disp_attr), ttl_sec=ttl)
+    elif disp_attr:
+        labels = [disp_attr]
+
+    # Resolve the per-option argument command (optional)
+    args = []
+    if arg_attr:
+        if is_cmd(arg_attr):
+            args = run_shell_capture_lines(cmd_of(arg_attr), ttl_sec=ttl)
+        else:
+            args = [arg_attr]
+
+    if not labels:
+        return []
+
+    result = []
+    for i, label in enumerate(labels):
+        # Build the action: base action + quoted arg (if any)
+        if args and i < len(args) and args[i].strip():
+            full_action = f"{action} {shlex.quote(args[i].strip())}"
+        else:
+            full_action = action
+        attrs = {
+            "display": label,
+            "action": full_action,
+        }
+        if afterclick:
+            attrs["afterclick"] = afterclick
+        result.append(_SyntheticChoice(attrs, line=getattr(elem, "line", -1)))
+    return result
+
+
+def expand_choices(children) -> list:
+    """
+    Return a flat list of <choice> elements, expanding any <choice_cmd>
+    children into synthetic <choice> elements. Plain <choice> children are
+    passed through unchanged. Order is preserved.
+    """
+    out = []
+    for c in children:
+        if c.kind == "choice":
+            out.append(c)
+        elif c.kind == "choice_cmd":
+            out.extend(expand_choice_cmd(c))
+    return out
+
+
+def is_empty_or_null(s: str) -> bool:
+    s = (s or "").strip()
+    return s == "" or s.lower() == "null"
+
+def _icon_image(icon: str, size: int):
+    """A Gtk.Image for `icon`: an icon name from the icon theme (symbolic
+    icons take the text colour, so they follow focus and hover styles) or a
+    path to an image file. None if it cannot be loaded."""
+    try:
+        if icon.startswith("/") or icon.startswith("."):
+            if not os.path.exists(icon):
+                return None
+            gi.require_version('GdkPixbuf', '2.0')
+            from gi.repository import GdkPixbuf
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(icon, size, size, True)
+            return Gtk.Image.new_from_pixbuf(pixbuf)
+        if not Gtk.IconTheme.get_default().has_icon(icon):
+            return None
+        img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        img.set_pixel_size(size)
+        return img
+    except Exception as e:
+        debug_print(f"[ICON] cannot load {icon}: {e}")
+        return None
+
+def _apply_icon(btn: Gtk.Button, text: str, elem, vertical: bool = False):
+    """Put the element's `icon` (attribute) next to the button's label, or
+    above it when `vertical`. An empty label gives an icon-only button.
+    `iconsize` sets the size in pixels. Returns the label, or None when the
+    element has no usable icon (the button keeps its plain label)."""
+    icon = ((elem.attrs.get("icon", "") if elem is not None else "") or "").strip()
+    if not icon:
+        return None
+    try:
+        size = int((elem.attrs.get("iconsize", "") or "0").strip() or 0)
+    except ValueError:
+        size = 0
+    img = _icon_image(icon, size or (32 if vertical else 20))
+    if img is None:
+        return None
+    img.get_style_context().add_class("cc-icon")
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL,
+                  spacing=6 if vertical else 8)
+    box.set_halign(Gtk.Align.START if vertical else Gtk.Align.CENTER)
+    box.set_valign(Gtk.Align.CENTER)
+    box.pack_start(img, False, False, 0)
+    lbl = None
+    if text:
+        lbl = Gtk.Label(label=text)
+        lbl.get_style_context().add_class("cc-label")
+        if vertical:
+            lbl.set_xalign(0.0)
+        box.pack_start(lbl, False, False, 0)
+    old = btn.get_child()
+    if old is not None:
+        btn.remove(old)
+    btn.add(box)
+    box.show_all()
+    btn.get_style_context().add_class("cc-has-icon")
+    return lbl
+
+def _focus_widget(widget: Gtk.Widget):
+    # Temporarily disable focus to avoid conflicts with touchscreen
+    # Just do nothing for now
+    pass
+
+def _activate_widget(widget: Gtk.Widget):
+    if isinstance(widget, Gtk.ToggleButton):
+        try:
+            # For tabs, always activate (don't toggle)
+            if hasattr(widget, '_tab_target'):
+                widget.set_active(True)
+            else:
+                widget.set_active(not widget.get_active())
+        except Exception as e:
+            debug_print(f"[ACTIVATE] Exception {e} for {widget}")
+
+    elif isinstance(widget, Gtk.Switch):
+        try:
+            # Toggle the switch state and emit the state-set signal
+            new_state = not widget.get_active()
+            widget.set_active(new_state)
+            widget.set_state(new_state)
+            # Emit the state-set signal to trigger our handler
+            widget.emit("state-set", new_state)
+        except Exception as e:
+            debug_print(f"[ACTIVATE] Exception {e} for {widget}")
+
+    elif isinstance(widget, Gtk.Button): # ToggleButton is a subclass of Button
+        try:
+            widget.emit("clicked")
+        except Exception as e:
+            debug_print(f"[ACTIVATE] Exception {e} for {widget}")
+
+# Parse width/height - handle both pixels and percentages
+def parse_dimension(value: str, reference_size: int = 100) -> int | None:
+    """Parse dimension value, supporting both pixels and percentages"""
+    if not value:
+        return None
+
+    value = value.strip()
+    if value.endswith('%'):
+        # Parse percentage
+        try:
+            percentage = float(value[:-1])
+            return int(reference_size * percentage / 100)
+        except ValueError:
+            return None
+    else:
+        # Parse pixels
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+#---------------------------------- main class
+class UICore:
+    def __init__(self, css_path: str, fullscreen: bool = False, window_size: tuple[int, int] | None = None,
+                 screen: str | None = None):
+        self.css_path = css_path
+        self.fullscreen = fullscreen
+        self.window_size = window_size
+        self.screen = screen  # connector name or index; overrides batocera.conf
+        self._selected_monitor = None  # last monitor applied (wayland)
+        self.window: Gtk.Window | None = None
+        self.focus_rows: list[Gtk.EventBox] = []
+        self.focus_index: int = 0
+        self.refreshers: list[RefreshTask] = []
+        # store refresh functions by id to be able to refresh widget from an id list
+        self.refreshfunctionsbyids: dict = {}
+        self.debouncer = Debouncer(ACTION_DEBOUNCE_MS)
+        self._gamepads = GamePads()
+        self._inactivity_timer_id = None
+        self._inactivity_timeout_seconds = 0
+        self.rendered_ids: set[str] = set()  # Track IDs of rendered elements
+        self._conditional_widgets = []  # Track widgets with !id() conditions for dynamic updates
+        self.quit_mode = "hide" # versus close
+        self._handle_gamepad_action = self._handle_gamepad_action_main
+        self._tab_switching_in_progress = False  # Prevent recursive tab switching
+        
+        # Global focus management
+        self._all_focusable_widgets = set()  # Track all widgets that can receive focus
+        self._currently_focused_widget = None
+        
+        # Animated GIF optimization
+        self._active_animations = []  # Track active animated images
+        self._animations_paused = False  # Track if animations are paused
+        self._max_gif_fps = int(os.environ.get('BCC_MAX_GIF_FPS', '15'))  # Configurable max FPS
+        self._enable_gif_animations = os.environ.get('BCC_ENABLE_GIF_ANIMATIONS', '1') != '0'
+        self._bar_buttons = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+
+    # Detect DPI (Thor bottom screen)
+    def _dpi_from_monitor(self, monitor: Gdk.Monitor) -> float | None:
+        try:
+            geo = monitor.get_geometry()
+            mm_width = monitor.get_width_mm() or 0
+            if mm_width > 0:
+                return geo.width / (mm_width / 25.4)
+        except Exception as e:
+            debug_print(f"[DPI] monitor DPI failed: {e}")
+        return None
+
+    # Actual detection
+    def _get_window_dpi(self, win: Gtk.Window) -> float | None:
+        try:
+            gdk_win = win.get_window()
+            if not gdk_win:
+                return None
+
+            display = gdk_win.get_display()
+            if not display:
+                return None
+
+            monitor = None
+            if hasattr(display, "get_monitor_at_window"):
+                monitor = display.get_monitor_at_window(gdk_win)
+
+            # Fallbacks if needed
+            if monitor is None and hasattr(display, "get_primary_monitor"):
+                monitor = display.get_primary_monitor()
+
+            if monitor:
+                dpi = self._dpi_from_monitor(monitor)
+                if dpi:
+                    return dpi
+
+            # Last resort: screen "logical" DPI
+            screen = win.get_screen()
+            if screen:
+                res = screen.get_resolution()
+                if res and res > 0:
+                    return res
+        except Exception as e:
+            debug_print(f"[DPI] _get_window_dpi failed: {e}")
+        return None
+
+    # --- With dynamic DPI, need a "physical-ish" pixels for %-based sizing
+    def get_reference_dimensions(self) -> tuple[int, int]:
+        # Conservative defaults
+        ref_w, ref_h = 800, 600
+
+        try:
+            win = self.window
+            if win and win.get_realized():
+                gdk_win = win.get_window()
+                alloc = win.get_allocation()
+
+                logical_w = alloc.width
+                logical_h = alloc.height
+
+                scale_factor = gdk_win.get_scale_factor() if gdk_win is not None else 1
+                if scale_factor <= 0:
+                    scale_factor = 1
+
+                ref_w = int(logical_w * scale_factor)
+                ref_h = int(logical_h * scale_factor)
+
+            elif hasattr(self, "_window_width") and hasattr(self, "_max_height"):
+                # Fallback to what you already compute in build_window
+                ref_w = int(self._window_width)
+                ref_h = int(self._max_height)
+        except Exception as e:
+            debug_print(f"[REFSIZE] Failed to compute reference size: {e}")
+
+        return ref_w, ref_h
+
+    # ---- Window / CSS ----
+    # Compute and apply the window layout (size, margins, scale class) for the
+    # geometry of *monitor* on the layer-shell surface *win*. Used at build time
+    # and whenever the selected screen changes, so the window re-centers on
+    # screens with different resolutions.
+    def _apply_wayland_layout(self, win: Gtk.Window, monitor: Gdk.Monitor):
+        geometry = monitor.get_geometry()
+        sw, sh = geometry.width, geometry.height
+
+        if self.fullscreen:
+            width, max_height = sw, sh
+            scale_class = "full"
+            width_margin = height_margin = 0
+        elif self.window_size:
+            width, max_height = self.window_size
+            scale_class = "full" if width >= 1280 and max_height >= 720 else "small"
+            # A fixed --window size may exceed the selected monitor's
+            # resolution (e.g. dual-screen devices with different geometries
+            # and a launcher-passed size): clamp to fit, keep margins >= 0.
+            width = min(width, sw)
+            max_height = min(max_height, sh)
+            width_margin = max(0, (sw - width) // 2)
+            height_margin = max(0, (sh - max_height) // 5)
+        else:
+            width, height = sw, sh
+            scale_class = "small"
+            if sw >= 1280:
+                width = int(sw * 0.90)
+                scale_class = "full"
+            if sw >= 1920:
+                width = int(sw * 0.70)
+                scale_class = "full"
+            if sh >= 720:
+                height = int(sh * 0.95)
+                if scale_class == "small":
+                    scale_class = "medium"
+            if sh >= 1080:
+                height = int(sh * 0.80)
+                scale_class = "full"
+            if sh >= 2160:
+                scale_class = "xlarge"
+
+            if sw < 1280:
+                # Small screen (e.g. 720x720 handheld): use the full output
+                # with no margins. The layer-shell surface is anchored to
+                # all four edges, so zero margins make it cover the whole
+                # screen, giving the content room and letting the scrolled
+                # window handle overflow (footer not clipped).
+                max_height = sh
+                width = sw
+                width_margin = 0
+                height_margin = 0
+            else:
+                # Larger screen: keep the centered, margin-based layout.
+                max_height = sh
+                width_margin = (sw - width) // 2
+                height_margin = (sh - height) // 5
+
+        debug_print(f"[DPI] Wayland layout on {sw}x{sh}: win:{width}x{max_height} margins:{width_margin}x{height_margin}")
+
+        # Update stored dimensions (used by rows, reference sizing, X11-less paths)
+        self._window_width = width
+        self._max_height = max_height
+        self._screen_x = self._screen_y = 0
+        self._screen_width = sw
+        self._screen_height = sh
+
+        # Update scale CSS class
+        if getattr(self, "_scale_class", None) and self._scale_class != scale_class:
+            try:
+                ctx = win.get_style_context()
+                ctx.remove_class(f"scale-{self._scale_class}")
+                ctx.add_class(f"scale-{scale_class}")
+            except Exception:
+                pass
+        self._scale_class = scale_class
+
+        # Apply margins and resize the surface
+        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, height_margin)
+        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.BOTTOM, 4 * height_margin)
+        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, width_margin)
+        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.RIGHT, width_margin)
+        win.resize(width, max_height)
+
+    def build_window(self):
+        display = Gdk.Display.get_default()
+        backend = (display.get_name() or "").lower()
+        is_wayland = "wayland" in backend
+
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title(WINDOW_TITLE)
+
+        # A window with an alpha channel where the screen can show one
+        # (Wayland/labwc, or X11 with a compositor). The "cc-translucent"
+        # class then lets a theme round the panel and tint it see-through;
+        # elsewhere the window stays opaque as before.
+        screen = win.get_screen()
+        rgba_visual = screen.get_rgba_visual() if screen is not None else None
+        self._translucent = bool(rgba_visual is not None and screen.is_composited())
+        if self._translucent:
+            win.set_visual(rgba_visual)
+
+        # on wayland, force the window as an overlay
+        # and choose the 2nd screen if exists
+        if is_wayland:
+            GtkLayerShell.init_for_window(win)
+            GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+            GtkLayerShell.set_keyboard_interactivity(win, False)
+
+            display = Gdk.Display.get_default()
+            monitor = select_monitor(display, self.screen)
+            self._selected_monitor = monitor
+            if monitor is not None:
+                GtkLayerShell.set_monitor(win, monitor)
+
+            # screen size on wayland
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.BOTTOM, True)
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.LEFT, True)
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.RIGHT, True)
+
+        # Undecorated on both X11 and Wayland
+        win.set_decorated(False)
+
+        if is_wayland:
+            monitor = monitor if monitor is not None else display.get_monitor(0)
+            self._apply_wayland_layout(win, monitor)
+            self._applied_layout_geometry = (self._screen_width, self._screen_height)
+            scale_class = self._scale_class
+            x0 = y0 = 0  # set by _apply_wayland_layout (Wayland positioning is margin-based)
+        else:
+            # xorg
+            win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+            win.set_keep_above(True)
+            win.set_resizable(True)
+            win.set_skip_taskbar_hint(False)
+            win.set_modal(False)
+            
+            x11_monitor = select_monitor(display, self.screen)
+            if x11_monitor is not None and hasattr(x11_monitor, "get_geometry"):
+                g = x11_monitor.get_geometry()
+                x0, y0, sw, sh = g.x, g.y, g.width, g.height
+            else:
+                x0, y0, sw, sh = get_primary_geometry()
+            debug_print(f"[DPI] X11 startup geometry:{sw}x{sh}")
+            # Handle fullscreen mode
+            if self.fullscreen:
+                width, max_height = sw, sh
+                scale_class = "full"
+                win.set_decorated(False)  # Remove window decorations for fullscreen
+            # Handle custom window size
+            elif self.window_size:
+                width, max_height = self.window_size
+                scale_class = "full" if width >= 1280 and max_height >= 720 else "small"
+            else:
+                width, max_height = sw, sh
+                scale_class = "small"
+                if sw >= 1280:
+                    width = int(sw * 0.90)
+                    scale_class = "full"
+                if sw >= 1920:
+                    width = int(sw * 0.70)
+                    scale_class = "full"
+                if sh >= 720:
+                    max_height = int(sh * 0.95)
+                    if scale_class == "small":
+                        scale_class = "medium"
+                if sh >= 1080:
+                    max_height = int(sh * 0.80)
+                    scale_class = "full"
+                if sh >= 2160:
+                    scale_class = "xlarge"
+
+        # style
+        win.get_style_context().add_class("popup-root")
+        win.set_name("popup-root")
+        if self._translucent:
+            win.get_style_context().add_class("cc-translucent")
+
+        # This is the initial scale on app lauch, but before labwc potentially moves
+        # it to a different screen (Thor). It is then updated in on_map()
+        win.get_style_context().add_class(f"scale-{scale_class}")
+
+        # Store dimensions for positioning
+        if is_wayland:
+            # width/max_height/sw/sh were computed and stored by
+            # _apply_wayland_layout (Wayland positioning is margin-based)
+            width = self._window_width
+            max_height = self._max_height
+            x0 = y0 = 0
+            sw = self._screen_width
+            sh = self._screen_height
+        self._window_width = width
+        self._max_height = max_height
+        self._screen_x = x0
+        self._screen_y = y0
+        self._screen_width = sw
+        self._screen_height = sh
+        self._scale_class = scale_class
+
+        # Set default size - use max_height as starting point
+        if not is_wayland:
+            win.set_default_size(width, max_height)
+
+        # Set geometry hints for both X11 and Wayland - defer to avoid blocking
+        def set_geometry_hints():
+            if not self.fullscreen:  # Don't set geometry hints for fullscreen
+                geom = Gdk.Geometry()
+                if self.window_size:
+                    # Custom window size - allow resizing
+                    geom.min_width = min(640, width)  # Minimum reasonable size
+                    geom.min_height = min(480, max_height)
+                    # Don't set max constraints for custom sizes
+                else:
+                    # Default behavior - fixed size
+                    geom.min_width = width
+                    geom.max_width = width
+                    geom.max_height = max_height
+                    win.set_geometry_hints(None, geom, Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE)
+                    return False
+                win.set_geometry_hints(None, geom, Gdk.WindowHints.MIN_SIZE)
+            return False
+        
+        # Defer geometry hints to avoid blocking window creation
+        if not is_wayland:
+            GLib.idle_add(set_geometry_hints)
+
+        # Store for later use
+        self._is_wayland = is_wayland
+
+        def on_realize(_w):
+            # Handle fullscreen mode
+            if self.fullscreen:
+                if is_wayland:
+                    # For Wayland, fullscreen is handled via layer-shell layout
+                    pass
+                else:
+                    # For X11, use GTK fullscreen
+                    win.fullscreen()
+            # On X11, position immediately after realize (non-fullscreen)
+            elif not is_wayland:
+                center_x = self._screen_x + (self._screen_width - self._window_width) // 2
+                if self._screen_height - self._max_height > 10:
+                    top_y = self._screen_y + 10
+                else:
+                    top_y = self._screen_y
+                win.move(max(0, center_x), max(0, top_y))
+
+        def on_map(_w):
+            # Ensure window is shown
+            win.show_all()
+            # show_all() also reveals widgets hidden by an `if`; re-hide them
+            # before anything is painted so they don't flash.
+            self._reapply_conditional_visibility()
+            win.present()
+
+            # At boot the display may not be fully enumerated when
+            # build_window() ran (or batocera-settings/resolution commands
+            # failed), so the layout may have been computed from the wrong
+            # monitor. Re-check the screen selection now that all monitors
+            # are known, and re-layout if the monitor changed.
+            if is_wayland:
+                try:
+                    display = Gdk.Display.get_default()
+                    mon = select_monitor(display, self.screen)
+                    if mon is not None and mon is not self._selected_monitor:
+                        self._selected_monitor = mon
+                        self._apply_wayland_layout(win, mon)
+                        GtkLayerShell.set_monitor(win, mon)
+                except Exception as e:
+                    debug_print(f"[SCREEN] on_map re-selection failed: {e}")
+
+            dpi = self._get_window_dpi(win)
+            debug_print(f"[DPI] {"Wayland" if is_wayland else "X11"} DPI={int(dpi) if dpi is not None else 'unknown'} initially for '{self._scale_class}' screens")
+
+            if dpi:
+                old_class = self._scale_class
+                # Pick a scale tier from the physical display resolution.
+                #   - very small (CRT)         -> small  (10px)
+                #   - small (<=720p handhelds) -> medium (14px)
+                #   - 4K                       -> xlarge (32px)
+                #   - normal and up            -> DPI-driven full/large
+                if self._window_width < 480 or self._max_height < 480:
+                    new_class = "small"
+                elif self._window_width < 1024 or self._max_height < 600:
+                    new_class = "medium"
+                elif self._screen_height >= 2160:
+                    new_class = "xlarge"
+                elif dpi >= 140:
+                    new_class = "large"
+                else:
+                    new_class = "full"
+
+                if new_class != old_class:
+                    ctx = win.get_style_context()
+                    ctx.remove_class(f"scale-{old_class}")
+                    ctx.add_class(f"scale-{new_class}")
+                    self._scale_class = new_class
+                    debug_print(f"[DPI] scale_class changed {old_class} -> {new_class}")
+
+            try:
+                win.grab_focus()
+            except Exception as e:
+                debug_print(f"[FOCUS] Exception grab_focus failed: {e}")
+
+        # Track if we have an open dialog to prevent closing on dialog focus
+        self._dialog_open = False
+        # Track if we should suspend the inactivity timer (for document/confirm dialogs, not choice popups)
+        self._suspend_inactivity_timer = False
+        # Track if dialog allows inactivity timeout (choice popups allow it, document/confirm don't)
+        self._dialog_allows_timeout = False
+        # Track startup time to ignore initial gamepad input
+        self._startup_time = time.time()
+        self._startup_ignore_duration = 0.3  # Ignore gamepad input for 300ms after startup
+
+        # Track when we're about to show a dialog (set by button callbacks)
+        self._about_to_show_dialog = False
+
+        def on_focus_out(_w, ev):
+            # If we're about to show a dialog or have one open, ignore this focus-out
+            if self._about_to_show_dialog or self._dialog_open:
+                return False
+
+            # Otherwise, close after a delay
+            def check_and_close():
+                # Double-check that no dialog opened during the delay
+                if self._dialog_open:
+                    return False
+                self.quit()
+                return False
+
+            GLib.timeout_add(100, check_and_close)
+            return False
+
+        # Connect event handlers for user interaction
+        def on_button_motion_notify(_w, _ev):
+            if self._inactivity_timeout_seconds > 0 and not self._suspend_inactivity_timer:
+                self.reset_inactivity_timer()
+            return False
+
+        win.connect("realize", on_realize)
+        win.connect("map", on_map)
+        win.connect("key-press-event", self._on_key_press)
+        win.connect("focus-out-event", on_focus_out)
+        win.connect("button-press-event", on_button_motion_notify)
+        win.connect("motion-notify-event", on_button_motion_notify)
+
+        # Enable events for mouse interaction
+        win.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+
+        self.window = win
+        return win
+
+    def apply_css(self):
+        if not self.css_path:
+            print("ERROR: No CSS path provided")
+            return
+        if not os.path.exists(self.css_path):
+            print(f"ERROR: CSS file not found: {self.css_path}")
+            return
+
+        debug_print(f"[CSS] Loading CSS from: {self.css_path}")
+        prov = Gtk.CssProvider()
+        try:
+            with open(self.css_path, "rb") as f:
+                css_data = f.read()
+                debug_print(f"[CSS] CSS file size: {len(css_data)} bytes")
+
+                prov.load_from_data(css_data)
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(),
+                prov,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+        except Exception as e:
+            debug_print(f"[CSS] CSS load failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # ---- Animated GIF Control ----
+    def pause_animations(self):
+        """Pause all active GIF animations to save CPU"""
+        if self._animations_paused:
+            return
+        self._animations_paused = True
+        for img_widget in self._active_animations:
+            if img_widget and hasattr(img_widget, '_animation_timeout_id'):
+                # Stop the animation timeout
+                if img_widget._animation_timeout_id:
+                    try:
+                        GLib.source_remove(img_widget._animation_timeout_id)
+                    except Exception:
+                        pass
+                    img_widget._animation_timeout_id = None
+
+    def resume_animations(self):
+        """Resume all paused GIF animations"""
+        if not self._animations_paused:
+            return
+        self._animations_paused = False
+        for img_widget in self._active_animations:
+            if img_widget and hasattr(img_widget, '_animation'):
+                # Restart the animation with scaling parameters if available
+                target_width = getattr(img_widget, '_target_width', None)
+                target_height = getattr(img_widget, '_target_height', None)
+                self._start_animation_playback(img_widget, img_widget._animation, target_width, target_height)
+
+    def _apply_conditional_visibility(self, widget, should_show: bool):
+        """Set a conditional widget's visibility, restarting GIF playback if
+        a hidden animated <img> is becoming visible. A widget that starts
+        hidden (if="...") is never realized in GTK3, so its animation loop
+        never got to run its first frame; nothing else restarts it once the
+        condition flips the widget visible, so this is the one place that
+        does.
+
+        Guarded by the absence of a live _animation_timeout_id: a widget
+        that was already realized once keeps ticking in the background even
+        while hidden again later (advance_frame only checks get_realized(),
+        not get_visible()), so restarting unconditionally here would spawn a
+        second, parallel timeout chain double-driving the same frames."""
+        old_visible = widget.get_visible()
+        widget._cond_visible = should_show
+        widget.set_visible(should_show)
+        if (should_show and not old_visible and hasattr(widget, '_animation')
+                and not self._animations_paused
+                and not getattr(widget, '_animation_timeout_id', None)):
+            self._start_animation_playback(widget, widget._animation,
+                                            getattr(widget, '_target_width', None),
+                                            getattr(widget, '_target_height', None))
+        return old_visible
+
+    def _reapply_conditional_visibility(self):
+        """Re-hide conditional widgets whose `if` is currently false.
+
+        Gtk's show_all() recursively shows every descendant, including the
+        widgets hidden by an `if`, so each show_all() (window map, tab
+        switch) would make them flash until the next recompute. Calling this
+        right after show_all() hides them again in the same main-loop
+        iteration, before anything is painted. Widgets never evaluated yet
+        (no _cond_visible) are left alone."""
+        for widget, _cond in self._conditional_widgets:
+            if getattr(widget, "_cond_visible", None) is False and widget.get_visible():
+                widget.set_visible(False)
+
+    @staticmethod
+    def _is_widget_shown(widget) -> bool:
+        """True if the widget and all its ancestors (up to the toplevel
+        window) are visible; Gtk's get_visible() only reports the widget's
+        own flag."""
+        w = widget
+        while w is not None and not isinstance(w, Gtk.Window):
+            if not w.get_visible():
+                return False
+            w = w.get_parent()
+        return True
+
+    def _is_row_navigable(self, row) -> bool:
+        """A row can take focus only if it is shown and, for vgroup rows,
+        has at least one shown cell with a control."""
+        if not self._is_widget_shown(row):
+            return False
+        cells = getattr(row, "_cells", None)
+        if cells:
+            return any(controls and self._is_widget_shown(ev) for ev, controls in cells)
+        return True
+
+    def _next_navigable_row_index(self, start: int, step: int):
+        """Index of the next navigable row from `start` in direction `step`
+        (wrapping), or None if no row is navigable."""
+        n = len(self.focus_rows)
+        for i in range(1, n + 1):
+            idx = (start + step * i) % n
+            if self._is_row_navigable(self.focus_rows[idx]):
+                return idx
+        return None
+
+    def _ensure_visible_cell(self, row):
+        """Make sure a vgroup row's current cell is a shown one."""
+        cells = getattr(row, "_cells", None)
+        if not cells:
+            return
+        idx = getattr(row, "_cell_index", 0)
+        if 0 <= idx < len(cells):
+            ev, controls = cells[idx]
+            if controls and self._is_widget_shown(ev):
+                return
+        for i, (ev, controls) in enumerate(cells):
+            if controls and self._is_widget_shown(ev):
+                row._cell_index = i
+                ev._control_index = 0
+                return
+
+    def _fix_focus_if_hidden(self):
+        """If a recompute just hid the focused row, move focus to the next
+        visible one so the user never sits on an invisible item."""
+        if not self.focus_rows or self.focus_index >= len(self.focus_rows):
+            return
+        if not self.window or not self.window.get_visible():
+            return
+        if not self._is_row_navigable(self.focus_rows[self.focus_index]):
+            self.move_focus(+1)
+
+    def _start_animation_playback(self, img_widget, animation, target_width=None, target_height=None):
+        """Start playing an animation with frame rate limiting and optional scaling"""
+        if not animation or animation.is_static_image():
+            return
+        
+        # Calculate frame delay with FPS limiting
+        min_delay_ms = int(1000 / self._max_gif_fps) if self._max_gif_fps > 0 else 0
+        
+        # Determine if we need to scale frames
+        need_scaling = target_width or target_height
+
+        def advance_frame():
+            if self._animations_paused:
+                return False  # Stop the timeout
+            
+            if not img_widget:
+                return False  # Widget destroyed
+
+            if not img_widget.get_realized():
+                # Not yet realized - e.g. still hidden behind an `if`, or
+                # this first tick landed before the window's very first
+                # present() (show() flips visibility before presenting, so
+                # _apply_conditional_visibility's restart can race the
+                # widget actually becoming realizable). Keep polling at a
+                # light cadence instead of dying outright: this is the
+                # fallback for that race, not the primary restart path.
+                img_widget._animation_timeout_id = GLib.timeout_add(200, advance_frame)
+                return False
+
+            # Get the animation iterator
+            if not hasattr(img_widget, '_animation_iter'):
+                img_widget._animation_iter = animation.get_iter()
+            
+            iter = img_widget._animation_iter
+            
+            # Advance to next frame
+            iter.advance()
+            pixbuf = iter.get_pixbuf()
+            
+            # Scale frame if dimensions are specified. Note: gdk-pixbuf's
+            # animation iterator hands back the SAME pixbuf object every
+            # call (id(pixbuf) never changes) with its pixel buffer mutated
+            # in place each frame - so scaling can't be cached by identity;
+            # it must be redone fresh every single frame.
+            if need_scaling:
+                from gi.repository import GdkPixbuf
+                orig_width = pixbuf.get_width()
+                orig_height = pixbuf.get_height()
+
+                if target_width and target_height:
+                    # Both specified
+                    pixbuf = pixbuf.scale_simple(target_width, target_height, GdkPixbuf.InterpType.BILINEAR)
+                elif target_width:
+                    # Only width specified, maintain aspect ratio
+                    aspect = orig_height / orig_width
+                    new_height = int(target_width * aspect)
+                    pixbuf = pixbuf.scale_simple(target_width, new_height, GdkPixbuf.InterpType.BILINEAR)
+                elif target_height:
+                    # Only height specified, maintain aspect ratio
+                    aspect = orig_width / orig_height
+                    new_width = int(target_height * aspect)
+                    pixbuf = pixbuf.scale_simple(new_width, target_height, GdkPixbuf.InterpType.BILINEAR)
+
+            img_widget.set_from_pixbuf(pixbuf)
+            
+            # Get delay for next frame (in milliseconds)
+            delay = iter.get_delay_time()
+            
+            # Apply FPS limiting
+            if min_delay_ms > 0:
+                delay = max(delay, min_delay_ms)
+            
+            # Schedule next frame
+            img_widget._animation_timeout_id = GLib.timeout_add(delay, advance_frame)
+            return False  # Don't repeat this timeout (we schedule the next one)
+        
+        # Start the animation
+        advance_frame()
+
+    # ---- Keyboard / Focus ----
+    def _on_key_press(self, _w, ev: Gdk.EventKey):
+        key = Gdk.keyval_name(ev.keyval) or ""
+        if key.lower() == "escape":
+            self.quit()
+        elif key in ("Up", "KP_Up"):
+            self.move_focus(-1)
+        elif key in ("Down", "KP_Down"):
+            self.move_focus(+1)
+        elif key in ("Left", "KP_Left"):
+            self.row_left()
+        elif key in ("Right", "KP_Right"):
+            self.row_right()
+        elif key in ("Return", "KP_Enter", "space"):
+            self.activate_current()
+        return True
+
+    def _row_set_focused(self, row: Gtk.EventBox, focused: bool):
+        ctx = row.get_style_context()
+        if focused:
+            ctx.add_class("focused")
+        else:
+            ctx.remove_class("focused")
+
+    def unhighlight_row(self, prev_row):
+        self._row_set_focused(prev_row, False)
+        # Clear ALL highlights on the row we leave (vgroup cells and controls)
+        try:
+            if hasattr(prev_row, "_cells"):
+                for ev, controls in prev_row._cells:
+                    ev.get_style_context().remove_class("focused-cell")
+                    for ctrl in controls:
+                        ctx = ctrl.get_style_context()
+                        ctx.remove_class("focused-cell")
+                        ctx.remove_class("choice-selected")
+            # Also clear highlights from feature row items
+            if hasattr(prev_row, "_items"):
+                for item in prev_row._items:
+                    ctx = item.get_style_context()
+                    ctx.remove_class("focused-cell")
+                    ctx.remove_class("choice-selected")
+        except Exception:
+            pass
+
+    def move_focus(self, delta: int):
+        if not self.focus_rows:
+            return
+        
+        # Skip if controller navigation is suppressed (due to recent touch sync)
+        if hasattr(self, '_suppress_controller_navigation') and self._suppress_controller_navigation:
+            return
+            
+        self.reset_inactivity_timer()  # Reset timer on navigation
+        old = self.focus_index
+        # Skip rows hidden by an `if` condition (not selectable with the D-pad)
+        step = 1 if delta >= 0 else -1
+        new_index = old
+        for _ in range(max(1, abs(delta))):
+            nxt = self._next_navigable_row_index(new_index, step)
+            if nxt is None:
+                break
+            new_index = nxt
+        if new_index == old and not self._is_row_navigable(self.focus_rows[old]):
+            return  # nothing visible to move to
+        self.focus_index = new_index
+
+        prev_row = self.focus_rows[old]
+        self.unhighlight_row(prev_row)
+
+        new_row = self.focus_rows[self.focus_index]
+        self._row_set_focused(new_row, True)
+        _focus_widget(new_row)
+
+        # If new row has items (buttons), select the first one and highlight it
+        if hasattr(new_row, "_items") and new_row._items:
+            # Skip if controller focus is suppressed (due to recent touch sync)
+            if hasattr(self, '_suppress_controller_focus') and self._suppress_controller_focus:
+                return
+                
+            if not hasattr(new_row, "_item_index"):
+                new_row._item_index = 0
+            item = new_row._items[new_row._item_index]
+            # Apply highlight classes
+            self.apply_focus_classes_if_allowed(item)
+            _focus_widget(item)
+
+        # Apply vgroup cell highlight on new row (trigger focus-in to apply highlights properly)
+        try:
+            if hasattr(new_row, "_cells") and new_row._cells:
+                # Skip if controller focus is suppressed (due to recent touch sync)
+                if hasattr(self, '_suppress_controller_focus') and self._suppress_controller_focus:
+                    return
+                    
+                # Initialize cell navigation for this row
+                if not hasattr(new_row, "_cell_index"):
+                    new_row._cell_index = 0
+                # Apply cell-based highlighting
+                self._apply_cell_highlight(new_row)
+        except Exception:
+            pass
+        
+        # Auto-scroll to keep focused element visible (with delay for layout)
+        def delayed_scroll():
+            self.scroll_to_focused_widget()
+            return False
+        GLib.timeout_add(10, delayed_scroll)
+
+    def _apply_cell_highlight(self, row):
+        """Apply highlighting to the current cell control in a row"""
+        if not hasattr(row, "_cells") or not row._cells:
+            return
+        
+        # Skip if controller focus is suppressed (due to recent touch sync)
+        if hasattr(self, '_suppress_controller_focus') and self._suppress_controller_focus:
+            return
+        
+        self._ensure_visible_cell(row)
+        cell_index = getattr(row, "_cell_index", 0)
+        if cell_index >= len(row._cells):
+            cell_index = 0
+            row._cell_index = cell_index
+
+        cell_ev, controls = row._cells[cell_index]
+        if controls:
+            ctrl_idx = getattr(cell_ev, "_control_index", 0)
+            if ctrl_idx >= len(controls):
+                ctrl_idx = 0
+                cell_ev._control_index = ctrl_idx
+                
+            # Apply highlighting to the current control
+            ctrl = controls[ctrl_idx]
+            if self.apply_focus_classes_if_allowed(ctrl):
+                _focus_widget(ctrl)
+                # Auto-scroll to keep focused element visible (with delay)
+                def delayed_scroll():
+                    self.scroll_to_focused_widget()
+                    return False
+                GLib.timeout_add(10, delayed_scroll)
+
+    def scroll_to_focused_widget(self):
+        """Automatically scroll to keep the focused widget visible"""
+        try:
+            if not self.focus_rows or self.focus_index >= len(self.focus_rows):
+                return
+                
+            focused_row = self.focus_rows[self.focus_index]
+            focused_widget = None
+            
+            # Determine which widget is currently focused
+            if hasattr(focused_row, "_items") and focused_row._items:
+                item_index = getattr(focused_row, "_item_index", 0)
+                if 0 <= item_index < len(focused_row._items):
+                    focused_widget = focused_row._items[item_index]
+            elif hasattr(focused_row, "_cells") and focused_row._cells:
+                cell_index = getattr(focused_row, "_cell_index", 0)
+                if 0 <= cell_index < len(focused_row._cells):
+                    cell_ev, controls = focused_row._cells[cell_index]
+                    ctrl_index = getattr(cell_ev, "_control_index", 0)
+                    if 0 <= ctrl_index < len(controls):
+                        focused_widget = controls[ctrl_index]
+            else:
+                # Use the row itself if no specific widget
+                focused_widget = focused_row
+            
+            if focused_widget and hasattr(self, '_scrolled_window'):
+                self._scroll_widget_into_view(focused_widget, self._scrolled_window)
+                
+        except Exception as e:
+            debug_print(f"[SCROLL] Error in scroll_to_focused_widget: {e}")
+
+    def _scroll_widget_into_view(self, widget, scrolled_window):
+        """Scroll the widget into view within the scrolled window"""
+        try:
+            # Make sure the widget is realized and has a window
+            if not widget.get_realized():
+                widget.realize()
+            
+            # Get the widget's allocation
+            widget_alloc = widget.get_allocation()
+            
+            # Get the scrolled window's viewport
+            viewport = None
+            scrolled_child = scrolled_window.get_child()
+            if scrolled_child and hasattr(scrolled_child, 'get_child'):
+                # If there's a viewport, get its child
+                viewport = scrolled_child
+                content = scrolled_child.get_child()
+            else:
+                content = scrolled_child
+            
+            if not content:
+                return
+            
+            # Try a different approach - use the widget's position relative to its toplevel
+            toplevel = widget.get_toplevel()
+            if not toplevel:
+                return
+            
+            # Get widget position relative to toplevel
+            try:
+                widget_x, widget_y = widget.translate_coordinates(toplevel, 0, 0)
+            except Exception as e:
+                debug_print(f"[SCROLL] Failed to translate widget coordinates to toplevel: {e}")
+                return
+            
+            # Get scrolled window position relative to toplevel
+            try:
+                scroll_x, scroll_y = scrolled_window.translate_coordinates(toplevel, 0, 0)
+            except Exception as e:
+                debug_print(f"[SCROLL] Failed to translate scrolled window coordinates to toplevel: {e}")
+                return
+            
+            # Calculate relative position
+            relative_y = widget_y - scroll_y
+            
+            # Get scrolled window dimensions and current position
+            scrolled_alloc = scrolled_window.get_allocation()
+            vadjustment = scrolled_window.get_vadjustment()
+            current_scroll = vadjustment.get_value()
+            
+            # Calculate visible area (relative to scrolled window)
+            visible_top = current_scroll
+            visible_bottom = current_scroll + scrolled_alloc.height
+            
+            # Calculate widget bounds (we need to adjust for current scroll position)
+            widget_top = relative_y + current_scroll
+            widget_bottom = widget_top + widget_alloc.height
+            
+            # Add padding
+            padding = min(40, max(10, scrolled_alloc.height // 20))
+            
+            # Determine if we need to scroll
+            new_scroll = None
+            
+            if widget_top < visible_top + padding:
+                # Widget is above visible area, scroll up
+                new_scroll = max(vadjustment.get_lower(), widget_top - padding)
+            elif widget_bottom > visible_bottom - padding:
+                # Widget is below visible area, scroll down
+                max_scroll = vadjustment.get_upper() - vadjustment.get_page_size()
+                new_scroll = min(max_scroll, widget_bottom - scrolled_alloc.height + padding)
+            
+            # Apply the scroll if needed
+            if new_scroll is not None and abs(new_scroll - current_scroll) > 1:
+                # Use immediate scroll for debugging
+                vadjustment.set_value(new_scroll)
+                
+        except Exception as e:
+            debug_print(f"[SCROLL] Error in _scroll_widget_into_view: {e}")
+
+    def _smooth_scroll_to(self, adjustment, target_value):
+        """Smoothly scroll to the target value"""
+        try:
+            current_value = adjustment.get_value()
+            distance = target_value - current_value
+            
+            # If distance is small, just jump there
+            if abs(distance) < 10:
+                adjustment.set_value(target_value)
+                return
+            
+            # Smooth scroll animation
+            steps = 8
+            step_size = distance / steps
+            step_count = [0]  # Use list to allow modification in nested function
+            
+            def scroll_step():
+                step_count[0] += 1
+                if step_count[0] >= steps:
+                    adjustment.set_value(target_value)
+                    return False
+                else:
+                    new_value = current_value + (step_size * step_count[0])
+                    adjustment.set_value(new_value)
+                    return True
+            
+            GLib.timeout_add(16, scroll_step)  # ~60fps
+            
+        except Exception as e:
+            debug_print(f"[SCROLL] Error in _smooth_scroll_to: {e}")
+            # Fallback to immediate scroll
+            adjustment.set_value(target_value)
+
+    def sync_focus_to_widget(self, target_widget):
+        """Synchronize controller focus to a specific widget that was touched/clicked"""
+        if not self.focus_rows:
+            return
+            
+        # Set flag to prevent recursive focus applications
+        if hasattr(self, '_syncing_focus') and self._syncing_focus:
+            return
+        self._syncing_focus = True
+        
+        try:
+            # Find which row and item/cell contains this widget FIRST
+            target_row_idx = None
+            target_item_idx = None
+            target_cell_idx = None
+            target_ctrl_idx = None
+            
+            for row_idx, row in enumerate(self.focus_rows):
+                # Check if widget is in row._items (row-based navigation)
+                if hasattr(row, '_items') and row._items:
+                    for item_idx, item in enumerate(row._items):
+                        if item == target_widget:
+                            target_row_idx = row_idx
+                            target_item_idx = item_idx
+                            break
+                
+                # Check if widget is in row._cells (cell-based navigation)
+                if hasattr(row, '_cells') and row._cells:
+                    for cell_idx, (cell_ev, controls) in enumerate(row._cells):
+                        for ctrl_idx, ctrl in enumerate(controls):
+                            if ctrl == target_widget:
+                                target_row_idx = row_idx
+                                target_cell_idx = cell_idx
+                                target_ctrl_idx = ctrl_idx
+                                break
+                
+                if target_row_idx is not None:
+                    break
+            
+            if target_row_idx is None:
+                return
+            
+            # Update focus indices
+            self.focus_index = target_row_idx
+            target_row = self.focus_rows[target_row_idx]
+            
+            if target_item_idx is not None:
+                # Row-based navigation
+                target_row._item_index = target_item_idx
+                self._row_set_focused(target_row, True)
+                
+            elif target_cell_idx is not None:
+                # Cell-based navigation
+                target_row._cell_index = target_cell_idx
+                cell_ev = target_row._cells[target_cell_idx][0]
+                cell_ev._control_index = target_ctrl_idx
+                self._row_set_focused(target_row, True)
+            
+            # Auto-scroll to keep focused element visible after sync (with delay)
+            def delayed_scroll():
+                self.scroll_to_focused_widget()
+                return False
+            GLib.timeout_add(10, delayed_scroll)
+        
+        finally:
+            self._syncing_focus = False
+            # Temporarily suppress controller navigation after touch sync
+            self._suppress_controller_navigation = True
+            def re_enable_controller():
+                self._suppress_controller_navigation = False
+                return False
+            GLib.timeout_add(1000, re_enable_controller)  # 1 second suppression
+
+    def register_focusable_widget(self, widget):
+        """Register a widget as focusable for global focus management"""
+        self._all_focusable_widgets.add(widget)
+
+    def clear_widget_focus_completely(self, widget):
+        """Completely clear focus from a widget by removing and re-adding all classes"""
+        try:
+            ctx = widget.get_style_context()
+            
+            # Get all current classes
+            all_classes = list(ctx.list_classes())
+            
+            # Remove ALL classes
+            for cls in all_classes:
+                ctx.remove_class(cls)
+            
+            # Force a redraw with no classes
+            widget.queue_draw()
+            
+            # Re-add all classes EXCEPT focus classes
+            for cls in all_classes:
+                if cls not in ['focused-cell', 'choice-selected']:
+                    ctx.add_class(cls)
+            
+            # Force another redraw
+            widget.queue_draw()
+            
+        except Exception as e:
+            pass
+
+    def enforce_single_focus(self, target_widget):
+        """Ensure only the target widget has focus classes - DISABLED"""
+        # This function is disabled as it was causing issues
+        pass
+
+    def apply_focus_classes_if_allowed(self, widget, debug_name=""):
+        """Apply focus classes to widget"""
+        try:
+            ctx = widget.get_style_context()
+            ctx.add_class("focused-cell")
+            ctx.add_class("choice-selected")
+            widget.queue_draw()
+        except Exception as e:
+            pass
+        return True
+
+    def clear_all_focus_highlights(self):
+        """Clear focus highlights from ALL widgets in the focus system"""
+        try:
+            for row in self.focus_rows:
+                # Clear highlights from row items
+                if hasattr(row, "_items") and row._items:
+                    for item in row._items:
+                        try:
+                            ctx = item.get_style_context()
+                            ctx.remove_class("focused-cell")
+                            ctx.remove_class("choice-selected")
+                            # Force style invalidation
+                            ctx.invalidate()
+                            # Force visual update
+                            item.queue_draw()
+                        except:
+                            pass
+                
+                # Clear highlights from row cells
+                if hasattr(row, "_cells") and row._cells:
+                    for cell_ev, controls in row._cells:
+                        try:
+                            cell_ev.get_style_context().remove_class("focused-cell")
+                            cell_ev.get_style_context().invalidate()
+                            cell_ev.queue_draw()
+                            for ctrl in controls:
+                                ctx = ctrl.get_style_context()
+                                ctx.remove_class("focused-cell")
+                                ctx.remove_class("choice-selected")
+                                ctx.invalidate()
+                                ctrl.queue_draw()
+                        except:
+                            pass
+        except:
+            pass
+
+    def add_touch_sync_to_widget(self, widget):
+        """DISABLED - Add touchscreen synchronization to a widget"""
+        # Temporarily disable touch sync to isolate the double highlight issue
+        return
+
+    def make_synced_click_handler(self, original_handler, widget):
+        """Create a click handler that syncs focus before executing the original handler"""
+        def synced_handler(*args):
+            # Sync controller focus to the clicked widget
+            self.sync_focus_to_widget(widget)
+            # Execute the original handler
+            return original_handler(*args)
+        return synced_handler
+
+    def activate_current(self):
+        if not self.focus_rows:
+            return
+        self.reset_inactivity_timer()  # Reset timer on activation
+        row = self.focus_rows[self.focus_index]
+        if not self._is_row_navigable(row):
+            return  # never activate something hidden by an `if` condition
+
+        # For rows with items (buttons/toggles), do nothing when row is selected
+        # User must navigate to the specific button first
+        if hasattr(row, "_items") and row._items:
+            # Don't activate anything - user needs to use left/right to select button
+            return
+
+        # For rows without items (like vgroup cells), use the row's activate callback
+        cb = getattr(row, "_on_activate", None)
+        if callable(cb):
+            cb()
+
+    def get_index_active_tab(self):
+        for i, t in enumerate(self.window._tab_row._tabs):
+            if t.get_active():
+                return i
+        return None
+
+    def set_next_tab(self):
+        i = self.get_index_active_tab()
+        if i is not None:
+            i = i+1
+            while i < len(self.window._tab_row._tabs):
+                if self.window._tab_row._tabs[i].is_visible():
+                    self.window._tab_row._tabs[i].set_active(True)
+                    return
+                i = i+1
+
+    def set_previous_tab(self):
+        i = self.get_index_active_tab()
+        if i is not None:
+            i = i-1
+            while i >= 0:
+                if self.window._tab_row._tabs[i].is_visible():
+                    self.window._tab_row._tabs[i].set_active(True)
+                    return
+                i = i-1
+
+    def row_left(self):
+        row = self.focus_rows[self.focus_index] if self.focus_rows else None
+        if not row:
+            return
+
+        # Skip if controller navigation is suppressed (due to recent touch sync)
+        if hasattr(self, '_suppress_controller_navigation') and self._suppress_controller_navigation:
+            return
+
+        # Check if this is a tab row - tab rows should use their _on_left callback even if they have items
+        is_tab_row = hasattr(row, '_tabs') and hasattr(row, '_on_left')
+        
+        if is_tab_row:
+            # For tab rows, always use the _on_left callback
+            cb = getattr(row, "_on_left", None)
+            if callable(cb):
+                cb()
+        # If row has items, navigate and activate
+        elif hasattr(row, "_items") and row._items:
+            item_index = getattr(row, "_item_index", 0)
+            if item_index > 0:
+                # Clear highlight from old item
+                old_item = row._items[item_index]
+                old_ctx = old_item.get_style_context()
+                old_ctx.remove_class("focused-cell")
+                old_ctx.remove_class("choice-selected")
+                old_ctx.invalidate()
+                old_item.queue_draw()
+
+                # Move to new item
+                # first find the first visible
+                tmp_idx = item_index - 1
+                while tmp_idx > 0 and row._items[tmp_idx].is_visible() == False:
+                    tmp_idx = tmp_idx-1
+
+                # reset to the initial one if none is found
+                if row._items[tmp_idx].is_visible() == False:
+                    tmp_idx = item_index
+
+                # set the new one
+                row._item_index = tmp_idx
+                item = row._items[row._item_index]
+
+                # Highlight new item
+                if self.apply_focus_classes_if_allowed(item):
+                    _focus_widget(item)
+                    # Auto-scroll to keep focused element visible (with delay)
+                    def delayed_scroll():
+                        self.scroll_to_focused_widget()
+                        return False
+                    GLib.timeout_add(10, delayed_scroll)
+        else:
+            cb = getattr(row, "_on_left", None)
+            if callable(cb):
+                cb()
+
+    def row_right(self):
+        row = self.focus_rows[self.focus_index] if self.focus_rows else None
+        if not row:
+            return
+
+        # Skip if controller navigation is suppressed (due to recent touch sync)
+        if hasattr(self, '_suppress_controller_navigation') and self._suppress_controller_navigation:
+            return
+
+        # Check if this is a tab row - tab rows should use their _on_right callback even if they have items
+        is_tab_row = hasattr(row, '_tabs') and hasattr(row, '_on_right')
+        
+        if is_tab_row:
+            # For tab rows, always use the _on_right callback
+            cb = getattr(row, "_on_right", None)
+            if callable(cb):
+                cb()
+        # If row has items, navigate and activate
+        elif hasattr(row, "_items") and row._items:
+            item_index = getattr(row, "_item_index", 0)
+            if item_index < len(row._items) - 1:
+                # Clear highlight from old item
+                old_item = row._items[item_index]
+                old_ctx = old_item.get_style_context()
+                old_ctx.remove_class("focused-cell")
+                old_ctx.remove_class("choice-selected")
+                old_ctx.invalidate()
+                old_item.queue_draw()
+
+                # Move to new item
+                # first find the first visible
+                tmp_idx = item_index + 1
+                while tmp_idx < len(row._items)-1 and row._items[tmp_idx].is_visible() == False:
+                    tmp_idx = tmp_idx+1
+
+                # reset to the initial one if none is found
+                if row._items[tmp_idx].is_visible() == False:
+                    tmp_idx = item_index
+
+                # set the new one
+                row._item_index = tmp_idx
+                item = row._items[row._item_index]
+
+                # Highlight new item
+                if self.apply_focus_classes_if_allowed(item):
+                    _focus_widget(item)
+                    # Auto-scroll to keep focused element visible (with delay)
+                    def delayed_scroll():
+                        self.scroll_to_focused_widget()
+                        return False
+                    GLib.timeout_add(10, delayed_scroll)
+        else:
+            cb = getattr(row, "_on_right", None)
+            if callable(cb):
+                cb()
+
+    def register_row(self, row: Gtk.EventBox):
+        row.set_can_focus(True)
+        row.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.FOCUS_CHANGE_MASK)
+        row.connect("focus-in-event", lambda w, *_: self._row_set_focused(w, True))
+        row.connect("focus-out-event", lambda w, *_: self._row_set_focused(w, False))
+        row.connect("button-press-event", lambda *_: self._activate_row(row))
+        self.focus_rows.append(row)
+
+    def _activate_row(self, row: Gtk.EventBox):
+        cb = getattr(row, "_on_activate", None)
+        if callable(cb):
+            cb()
+
+    def hide(self, *_a):
+        self.pause_animations()  # Pause GIF animations to save CPU
+        self._stop_conditional_heartbeat()
+        self.window.hide()
+        self._gamepads.stopThread()
+        self.stop_refresh()
+
+    # Re-read the screen selection (batocera.conf / --screen) and move the
+    # layer-shell surface to that monitor. Called at build time and on every
+    # show() so a setting changed from the UI takes effect on the next popup.
+    def _apply_screen_selection(self, win: Gtk.Window | None = None):
+        win = win or self.window
+        if not win or not getattr(self, "_is_wayland", False):
+            return
+        try:
+            display = Gdk.Display.get_default()
+            mon = select_monitor(display, self.screen)
+            if mon is not None:
+                geo = mon.get_geometry()
+                if (geo.width, geo.height) != getattr(self, "_applied_layout_geometry", None):
+                    # re-layout for the selected monitor's geometry (screens may
+                    # have different resolutions, and at boot the geometry may
+                    # still be wrong/stale until the compositor is done) then
+                    # move the surface to it
+                    self._selected_monitor = mon
+                    self._applied_layout_geometry = (geo.width, geo.height)
+                    self._apply_wayland_layout(win, mon)
+                    GtkLayerShell.set_monitor(win, mon)
+        except Exception as e:
+            debug_print(f"[SCREEN] apply screen selection failed: {e}")
+
+    # At boot, BCC may start before the compositor has finished configuring
+    # outputs: the monitor list can still change (or a monitor's geometry be
+    # stale). Re-check the screen selection for a short while and re-layout
+    # whenever the selected monitor's geometry changes.
+    def _schedule_screen_stabilization(self, tries: int = 10, interval_ms: int = 2000):
+        if not getattr(self, "_is_wayland", False):
+            return
+
+        def _stabilize_tick():
+            self._apply_screen_selection()
+            tries_left = getattr(self, "_stabilize_tries_left", 0)
+            self._stabilize_tries_left = max(0, tries_left - 1)
+            return self._stabilize_tries_left > 0
+
+        self._stabilize_tries_left = tries
+        GLib.timeout_add(interval_ms, _stabilize_tick)
+
+    # Shared helper for dialogs/popups: pick the monitor the BCC window is on,
+    # so popups follow the selected screen. Prefer the monitor under the main
+    # window (works even if the setting changed mid-session), fall back to the
+    # saved screen selection.
+    def monitor_for_popup(self) -> Gdk.Monitor | None:
+        try:
+            display = Gdk.Display.get_default()
+            # Monitor currently holding the BCC window
+            if self.window and self.window.get_window():
+                mon = display.get_monitor_at_window(self.window.get_window()) \
+                    if hasattr(display, "get_monitor_at_window") else None
+                if mon is not None:
+                    return mon
+            # Fall back to the saved selection / legacy default
+            return select_monitor(display, self.screen)
+        except Exception:
+            return None
+
+    def show(self, *_a):
+        self._apply_screen_selection()
+        self.start_gamepad()
+
+        self.window.present()
+        self.reset_inactivity_timer()  # Reset timer on button click
+        # start_refresh() does a force-fresh conditional recompute, so
+        # widget visibility (incl. this record icon) is correct for the
+        # window's first paint - nothing repaints between present() and
+        # here in this single-threaded call, so there's no point doing a
+        # separate (non-forced, possibly stale) pass before present().
+        self.start_refresh()
+        self.set_tab_focus()
+        # Reset focus to first row to prevent discrepancy after timeout
+        # Add small delay to allow tab content to be properly realized
+        def delayed_init_focus():
+            _init_focus(self)
+            return False
+        GLib.timeout_add(50, delayed_init_focus)
+        self.resume_animations()  # Resume GIF animations
+
+    def toggle_visibility(self, *_a):
+        if self.window.is_visible():
+            self.hide()
+        else:
+            self.show()
+
+    def set_tab_focus(self):
+        if not hasattr(self.window, '_tab_row') or not self.window._tab_row or len(self.window._tab_row._tabs) == 0:
+            return
+        
+        # Check if there's already an active and visible tab
+        active_tab = None
+        for tab in self.window._tab_row._tabs:
+            if tab.get_active() and tab.is_visible():
+                debug_print(f"[TAB] active tab found")
+                active_tab = tab
+                break
+        
+        # If no active visible tab, find first visible tab and activate it
+        if not active_tab:
+            debug_print(f"[TAB] NO active tab")
+            for i, tab in enumerate(self.window._tab_row._tabs):
+                if tab.is_visible():
+                    tab.set_active(True)
+                    # IMPORTANT: Update the _item_index to point to this tab
+                    if hasattr(self.window._tab_row, '_items') and tab in self.window._tab_row._items:
+                        tab_index = self.window._tab_row._items.index(tab)
+                        self.window._tab_row._item_index = tab_index
+                    break
+
+        debug_print(f"[TAB] active tab = {self.window._tab_row._items.index(tab)}")
+        tab.set_active(True)
+
+    def stop_refresh(self):
+        for r in self.refreshers:
+            r.stop()
+
+    def start_refresh(self):
+        # Defer refresh startup to prevent audio glitches during window creation
+        def start_refreshers_idle():
+            for r in self.refreshers:
+                r.start()
+            return False  # Don't repeat
+        
+        # Start refreshers after a short delay to let window settle
+        GLib.timeout_add(100, start_refreshers_idle)
+
+        # Force-fresh: the window is about to become visible and its
+        # conditional widgets' cached state can be arbitrarily stale (the
+        # heartbeat that keeps it warm was stopped in hide()). Get it right
+        # for the first paint instead of waiting for the next heartbeat tick.
+        self._recompute_conditionals(force_fresh=True)
+        self._start_conditional_heartbeat()
+
+    def quit(self, *_a):
+        # If there are open dialogs, destroy them first
+        if hasattr(self, '_current_dialog') and self._current_dialog:
+            try:
+                self._current_dialog.destroy()
+            except Exception:
+                pass
+            self._current_dialog = None
+        
+        if self.quit_mode == "hide":
+            self.hide()
+
+        if self.quit_mode == "close":
+            try:
+                if self.window:
+                    self.window.destroy()
+            except Exception:
+                pass
+
+            # close pads (after window is close to not wait)
+            self._gamepads.stopThread()
+
+            try:
+                Gtk.main_quit()
+            except Exception:
+                pass
+
+    def _handle_gamepad_action_call(self, action: str):
+        self._handle_gamepad_action(action)
+
+    def start_gamepad(self):
+        """Use evdev to read gamepad input with exclusive access (blocks EmulationStation)"""
+        if not EVDEV_AVAILABLE:
+            return
+        
+        # Defer gamepad startup to avoid blocking window creation
+        def start_gamepad_delayed():
+            self._gamepads.startThread(self._handle_gamepad_action_call)
+            return False
+
+        # Start gamepad after window is shown
+        GLib.timeout_add(50, start_gamepad_delayed)
+
+    def enable_gamepad_continuous_actions(self):
+        """Enable continuous gamepad actions (for document viewer)"""
+        self._gamepads.enable_continuous_actions()
+
+    def disable_gamepad_continuous_actions(self):
+        """Disable continuous gamepad actions (for main window)"""
+        self._gamepads.disable_continuous_actions()
+
+    def _handle_gamepad_action_main(self, action: str):
+        """Handle gamepad actions - works for both main window and dialogs"""
+        
+        # Ignore gamepad input for a short period after startup to avoid issues
+        # with buttons that were used to launch the application
+        if hasattr(self, '_startup_time'):
+            elapsed = time.time() - self._startup_time
+            if elapsed < 0:
+                # bcc starts at boot, before the network connects (or just in the seconds after),
+                # the network provides clock update that make sometimes date in the future (h700/cubexx)
+                # so, reset in case of date in the future...
+                self._startup_time = time.time()
+            else:
+                if elapsed < self._startup_ignore_duration:
+                    return
+        
+        # Reset inactivity timer on any gamepad action
+        try:
+            self.reset_inactivity_timer()
+        except Exception as e:
+            debug_print(f"[GP_ACTION] Error resetting inactivity timer from gamepad: {e}")
+
+        if action == "activate":
+            # Check if we're on a row with items and an item is selected
+            if self.focus_rows:
+                row = self.focus_rows[self.focus_index]
+                if hasattr(row, "_items") and row._items:
+                    item_index = getattr(row, "_item_index", 0)
+                    if 0 <= item_index < len(row._items):
+                        item = row._items[item_index]
+                        _activate_widget(item)
+                        return False
+            self.activate_current()
+        elif action == "back":
+            self.quit()
+        elif action == "axis_up":
+            self.move_focus(-1)
+        elif action == "axis_down":
+            self.move_focus(+1)
+        elif action == "axis_left":
+            self.row_left()
+        elif action == "axis_right":
+            self.row_right()
+        elif action == "pan_up":
+            self.move_focus(-1)  # Right stick up = move focus up
+        elif action == "pan_down":
+            self.move_focus(+1)  # Right stick down = move focus down
+        elif action == "pan_left":
+            self.row_left()  # Right stick left = navigate left
+        elif action == "pan_right":
+            self.row_right()  # Right stick right = navigate right
+        elif action == "next_tab":
+            self.set_next_tab()
+        elif action == "previous_tab":
+            self.set_previous_tab()
+        return False
+
+    # ---- Rendering helpers for new schema ----
+    def reset_inactivity_timer(self):
+        """Reset the inactivity timer when user interacts with the window"""
+        secs = self._inactivity_timeout_seconds
+        if secs <= 0 or self._suspend_inactivity_timer:
+            return
+
+        # Cancel existing timer only if present
+        tid = self._inactivity_timer_id
+        if tid is not None:
+            try:
+                GLib.source_remove(tid)
+            except Exception:
+                pass
+            self._inactivity_timer_id = None
+
+        # Start new timer - quit if no dialog is open, or if dialog allows timeout
+        def timeout_callback():
+            self._inactivity_timer_id = None
+            # Always quit on timeout - dialogs should prevent timer from running if needed
+            self.quit()
+            return False
+
+        # Use GLib.timeout_add_seconds directly
+        self._inactivity_timer_id = GLib.timeout_add_seconds(secs, timeout_callback)
+
+    def disable_timer(self):
+        if self._inactivity_timer_id is not None:
+            try:
+                GLib.source_remove(self._inactivity_timer_id)
+            except:
+                pass
+            self._inactivity_timer_id = None
+
+    def make_action_cb(self, action: str, key: str, afterclick: str = "", update_ids: set[str] = set(), on_done=None):
+        def cb(_w=None):
+            act = (action or "").strip()
+            if not act:
+                return
+            if self.debouncer.allow(key):
+                self.reset_inactivity_timer()  # Reset timer on button click
+                
+                def run_action_with_afterclick_or_update_ids():
+                    # Run the main action first
+                    run_shell_capture(act, get_output = False)
+                    if on_done:
+                        on_done()
+                    # Force a UI refresh after EVERY action
+                    GLib.idle_add(self.schedule_recompute_conditionals)
+                    if afterclick:
+                        GLib.idle_add(lambda: handle_afterclick_after(self, afterclick))
+                    if update_ids:
+                        GLib.idle_add(lambda: handle_update_ids(self, update_ids))
+                if afterclick:
+                    GLib.idle_add(lambda: handle_afterclick_before(self, afterclick))
+                run_off_main_thread(run_action_with_afterclick_or_update_ids)
+        return cb
+
+    def _start_conditional_heartbeat(self):
+        """Periodically re-check `if="${cmd}"` conditions while the window is
+        visible. Without this, a condition driven by state that changes
+        outside the control center (e.g. recording toggled via a gamepad
+        hotkey) never gets re-evaluated: nothing else re-triggers a
+        recompute except user actions taken inside this window."""
+        if getattr(self, "_conditional_heartbeat_id", None):
+            return
+        self._conditional_heartbeat_id = GLib.timeout_add(2000, self._conditional_heartbeat_tick)
+
+    def _stop_conditional_heartbeat(self):
+        tid = getattr(self, "_conditional_heartbeat_id", None)
+        if tid:
+            try:
+                GLib.source_remove(tid)
+            except Exception:
+                pass
+            self._conditional_heartbeat_id = None
+
+    def _conditional_heartbeat_tick(self):
+        self.schedule_recompute_conditionals()
+        return True  # keep repeating
+
+    def schedule_recompute_conditionals(self):
+        """
+        Coalesce recompute requests: at most one pass is ever pending on the
+        idle queue. The pass clears the flag on entry, so work arriving
+        mid-pass gets a follow-up pass.
+        """
+        if getattr(self, "_recompute_pending", False):
+            return
+        self._recompute_pending = True
+        GLib.idle_add(self._recompute_conditionals)
+
+    def _recompute_conditionals(self, force_fresh: bool = False):
+        """Recompute visibility for all widgets with 'if' conditions."""
+        self._recompute_pending = False
+        if hasattr(self, '_conditional_widgets'):
+            tab_visibility_changed = False
+
+            for widget, condition in self._conditional_widgets:
+                try:
+                    should_show = evaluate_if_condition(condition, self.rendered_ids, force_fresh=force_fresh)
+                    old_visible = self._apply_conditional_visibility(widget, should_show)
+
+                    # If this is a tab and visibility changed, mark for focus system update
+                    if hasattr(widget, '_tab_target') and old_visible != should_show:
+                        tab_visibility_changed = True
+
+                    debug_print(f"[RECOMPUTE] {condition} -> {should_show}, IDs={self.rendered_ids}")
+                except Exception:
+                    pass
+            
+            # Update tab focus system if any tab visibility changed
+            if tab_visibility_changed:
+                self._update_tab_focus_system()
+                # Also ensure the correct tab is active after visibility changes
+                self._ensure_valid_tab_active()
+
+            # Don't leave the focus on a row that just got hidden
+            self._fix_focus_if_hidden()
+
+    def _update_tab_focus_system(self):
+        """Update the focus system to only include visible tabs"""
+        for row in self.focus_rows:
+            if hasattr(row, '_items'):
+                original_count = len(row._items)
+                # Filter out invisible tabs from the items list
+                visible_items = []
+                for item in row._items:
+                    if hasattr(item, '_tab_target'):
+                        # This is a tab - only include if visible
+                        if item.get_visible():
+                            visible_items.append(item)
+                        else:
+                            pass
+                    else:
+                        # Not a tab - always include
+                        visible_items.append(item)
+                
+                # Update the items list with only visible items
+                row._items = visible_items
+                
+                # Reset item index if it's now out of bounds
+                if hasattr(row, '_item_index') and row._item_index >= len(row._items):
+                    row._item_index = max(0, len(row._items) - 1)
+
+    def _ensure_valid_tab_active(self):
+        """Ensure that a visible tab is active, and switch content accordingly"""
+        # Add small delay to ensure UI is fully constructed
+        def delayed_ensure_tab_active():
+            # Find tab rows
+            for row in self.focus_rows:
+                if hasattr(row, '_items') and hasattr(row, '_tabs'):
+                    # This is a tab row
+                    active_tab = None
+                    visible_tabs = []
+                    
+                    # Find currently active tab and collect visible tabs
+                    for tab in row._tabs:
+                        if tab.get_visible():
+                            visible_tabs.append(tab)
+                            if tab.get_active():
+                                active_tab = tab
+                    
+                    
+                    # Only switch tabs if NO tab is active
+                    if not active_tab:
+                        if visible_tabs:
+                            visible_tabs[0].set_active(True)
+                    elif not active_tab.get_visible():
+                        # Current active tab became invisible, switch to first visible
+                        if visible_tabs:
+                            visible_tabs[0].set_active(True)
+                    
+                    # Update the row's _items to only include visible tabs
+                    row._items = [tab for tab in row._tabs if tab.get_visible()]
+            return False
+        
+        GLib.timeout_add(100, delayed_ensure_tab_active)
+
+    # ---- Builders for UI elements ----
+    def build_text(self, parent_feat, sub, row_box, align_end=False):
+        lbl = Gtk.Label(label="")
+        lbl.get_style_context().add_class("value")
+        # wrap text by default
+        lbl.set_line_wrap(True)
+        lbl.set_line_wrap_mode(Pango.WrapMode.WORD)
+        lbl.set_max_width_chars(80)
+
+        # Apply ID as widget name for CSS
+        elem_id = (sub.attrs.get("id", "") or "").strip()
+        if elem_id:
+            # container gets background, padding, etc.
+            row_box.set_name(elem_id)
+            # label gets font, color, etc.
+            lbl.set_name(elem_id + "_label")
+
+        # Get alignment from attribute (default: center)
+        align_attr = (sub.attrs.get("align", "center") or "center").strip().lower()
+        if align_attr == "left":
+            lbl.set_xalign(0.0)
+            lbl.set_halign(Gtk.Align.START)
+        elif align_attr == "right":
+            lbl.set_xalign(1.0)
+            lbl.set_halign(Gtk.Align.END)
+        else:  # center (default)
+            lbl.set_xalign(0.5)
+            lbl.set_halign(Gtk.Align.CENTER)
+
+        (row_box.pack_end if align_end else row_box.pack_start)(lbl, False, False, 6)
+        disp = (sub.attrs.get("display", "") or "").strip()
+        refresh = float(sub.attrs.get("refresh", parent_feat.attrs.get("refresh", DEFAULT_REFRESH_SEC)))
+
+        # Handle dynamic visibility for id() and !id() conditions
+        if_condition = (sub.attrs.get("if", "") or "").strip()
+        if if_condition:
+            # Track this widget for dynamic visibility updates
+            self._conditional_widgets.append((lbl, if_condition))
+
+        def show_and_register(text: str, _lbl=lbl, _sub=sub, _core=self):
+            _lbl.set_text(text)
+            _lbl.set_visible(True)
+            register_element_id(_sub, _core.rendered_ids)
+
+        def hide_and_unregister(_lbl=lbl, _sub=sub, _core=self):
+            _lbl.set_text("")
+            _lbl.set_visible(False)
+            e_id = (_sub.attrs.get("id", "") or "").strip()
+            if e_id and e_id in _core.rendered_ids:
+                _core.rendered_ids.discard(e_id)
+
+        # Mixed substitution: expand string each tick
+        if "${" in disp and not is_cmd(disp):
+            def upd_expand(_l=lbl, _disp=disp, _sub=sub, _core=self):
+                result = expand_command_string(_disp)
+                result_stripped = result.strip()
+                element_id = (_sub.attrs.get("id", "") or "").strip()
+                
+                if result_stripped and result_stripped.lower() != "null":
+                    _l.set_text(result)
+                    _l.set_visible(True)
+                    # Only recompute if this element has an ID (affects conditionals)
+                    if element_id:
+                        register_element_id(_sub, _core.rendered_ids)
+                        _core._recompute_conditionals()
+                else:
+                    _l.set_text("")
+                    _l.set_visible(False)
+                    # Only recompute if this element had an ID that's being removed
+                    if element_id and element_id in _core.rendered_ids:
+                        _core.rendered_ids.discard(element_id)
+                        _core._recompute_conditionals()
+
+            self.refreshers.append(ExpandRefreshTask(upd_expand, refresh))
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            if element_id:
+                self.refreshfunctionsbyids[element_id] = {"function": upd_expand}
+
+            # Initial evaluation
+            def set_initial():
+                initial_value = expand_command_string(disp)
+                element_id = (sub.attrs.get("id", "") or "").strip()
+                
+                if is_empty_or_null(initial_value):
+                    hide_and_unregister()
+                    # Only recompute if element had an ID
+                    if element_id:
+                        self._recompute_conditionals()
+                else:
+                    show_and_register(initial_value)
+                    # Only recompute if element has an ID
+                    if element_id:
+                        self._recompute_conditionals()
+                return False
+
+            GLib.idle_add(set_initial)
+
+        elif is_cmd(disp):
+            c = cmd_of(disp)
+
+            # Initial evaluation
+            def set_initial():
+                initial_val = run_shell_capture_cached(c).strip()
+                element_id = (sub.attrs.get("id", "") or "").strip()
+                if is_empty_or_null(initial_val):
+                    hide_and_unregister()
+                    # Only recompute if element had an ID
+                    if element_id:
+                        self._recompute_conditionals()
+                else:
+                    show_and_register(initial_val)
+                    # Only recompute if element has an ID
+                    if element_id:
+                        self._recompute_conditionals()
+                return False
+
+            GLib.idle_add(set_initial)
+
+            def upd(val: str, _l=lbl, _sub=sub, _core=self):
+                txt = (val or "").strip()
+                element_id = (_sub.attrs.get("id", "") or "").strip()
+                if txt and txt.lower() != "null":
+                    _l.set_text(txt)
+                    _l.set_visible(True)
+                    # Only recompute if this element has an ID (affects conditionals)
+                    if element_id:
+                        register_element_id(_sub, _core.rendered_ids)
+                        _core._recompute_conditionals()
+                else:
+                    _l.set_text("")
+                    _l.set_visible(False)
+                    # Only recompute if this element had an ID that's being removed
+                    if element_id and element_id in _core.rendered_ids:
+                        _core.rendered_ids.discard(element_id)
+                        _core._recompute_conditionals()
+
+            self.refreshers.append(RefreshTask(upd, c, refresh))
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            if element_id:
+                self.refreshfunctionsbyids[element_id] = {"function": upd}
+
+        else:
+            # Static text
+            if is_empty_or_null(disp):
+                hide_and_unregister(lbl, sub, self)
+            else:
+                lbl.set_text(disp)
+                lbl.set_visible(True)
+                register_element_id(sub, self.rendered_ids)
+
+        return lbl
+
+
+    def build_button(self, parent_feat, sub, row_box, pack_end=False):
+        text = (sub.attrs.get("display", "") or "").strip()
+        if not text and not (sub.attrs.get("icon", "") or "").strip():
+            text = "Button"
+        action = sub.attrs.get("action", "")
+        afterclick = sub.attrs.get("afterclick", "")
+        update_ids = xmlattr_to_set(sub.attrs.get("updateids", ""))
+        btn = Gtk.Button.new_with_label(_(text) if text else "")
+        btn.get_style_context().add_class("cc-button")
+        btn.set_can_focus(True)
+        _apply_icon(btn, _(text) if text else "", sub)
+
+        # Get alignment from attribute (default: center)
+        align_attr = (sub.attrs.get("align", "center") or "center").strip().lower()
+        if align_attr == "left":
+            btn.set_halign(Gtk.Align.START)
+        elif align_attr == "right":
+            btn.set_halign(Gtk.Align.END)
+        else:  # center (default)
+            btn.set_halign(Gtk.Align.CENTER)
+
+        (row_box.pack_end if pack_end else row_box.pack_start)(btn, False, False, 6)
+        btn.connect("clicked", self.make_action_cb(action, key=f"btn:{text}:{action}", afterclick=afterclick, update_ids=update_ids))
+        
+        # Add touchscreen synchronization
+        self.add_touch_sync_to_widget(btn)
+
+        # Register ID for buttons (they always produce visual content)
+        register_element_id(sub, self.rendered_ids)
+
+        return btn
+
+    def build_toggle(self, parent_feat, sub, row_box, pack_end=False):
+        parent_label = (parent_feat.attrs.get("display", "") or parent_feat.attrs.get("name", "") or "").strip()
+        toggle_display = (sub.attrs.get("display", "") or "").strip()
+        toggle_value = (sub.attrs.get("value", "") or "").strip()  # New value parameter
+        action_on = sub.attrs.get("action_on", "")
+        action_off = sub.attrs.get("action_off", "")
+        afterclick = sub.attrs.get("afterclick", "")
+        update_ids = xmlattr_to_set(sub.attrs.get("updateids", ""))
+        refresh = float(sub.attrs.get("refresh", parent_feat.attrs.get("refresh", DEFAULT_REFRESH_SEC)))
+
+        # Determine which command to use for status
+        status_cmd = ""
+        if toggle_value and is_cmd(toggle_value):
+            status_cmd = cmd_of(toggle_value)
+        elif toggle_display and is_cmd(toggle_display):
+            status_cmd = cmd_of(toggle_display)
+
+        status_lbl = None
+        if status_cmd and toggle_display and is_cmd(toggle_display):
+            # Only show separate label if display is a command
+            status_lbl = Gtk.Label(label="")
+            status_lbl.get_style_context().add_class("value")
+            status_lbl.set_xalign(0.0)
+            (row_box.pack_end if pack_end else row_box.pack_start)(status_lbl, False, False, 6)
+
+        # Use parent feature label if display is a ${...}
+        tbtn_label = parent_label if (toggle_display and is_cmd(toggle_display)) else (toggle_display or parent_label or "toggle")
+        if is_cmd(tbtn_label):
+            tbtn_label = ""
+
+        tbtn = Gtk.ToggleButton.new_with_label(_(tbtn_label))
+        tbtn.get_style_context().add_class("cc-toggle")
+        tbtn.set_focus_on_click(True)
+
+        # style="tile": a quick-settings tile (icon, name, On/Off line)
+        # instead of an ON/OFF button. Same toggle underneath.
+        tile_state_lbl = None
+        if (sub.attrs.get("style", "") or "").strip().lower() == "tile":
+            tbtn.get_style_context().add_class("cc-tile")
+            name_lbl = _apply_icon(tbtn, _(tbtn_label), sub, vertical=True)
+            box = tbtn.get_child()
+            if name_lbl is None:
+                # No icon: name label only
+                old = tbtn.get_child()
+                if old is not None:
+                    tbtn.remove(old)
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                box.set_valign(Gtk.Align.CENTER)
+                name_lbl = Gtk.Label(label=_(tbtn_label))
+                name_lbl.set_xalign(0.0)
+                box.pack_start(name_lbl, False, False, 0)
+                tbtn.add(box)
+            name_lbl.get_style_context().add_class("cc-tile-name")
+            tile_state_lbl = Gtk.Label(label="")
+            tile_state_lbl.set_xalign(0.0)
+            tile_state_lbl.get_style_context().add_class("cc-tile-state")
+            box.pack_start(tile_state_lbl, False, False, 0)
+            box.show_all()
+        else:
+            _apply_icon(tbtn, _(tbtn_label), sub)
+
+        # Get alignment from attribute (default: center)
+        align_attr = (sub.attrs.get("align", "center") or "center").strip().lower()
+        if align_attr == "left":
+            tbtn.set_halign(Gtk.Align.START)
+        elif align_attr == "right":
+            tbtn.set_halign(Gtk.Align.END)
+        else:  # center (default)
+            tbtn.set_halign(Gtk.Align.CENTER)
+
+        (row_box.pack_end if pack_end else row_box.pack_start)(tbtn, False, False, 6)
+
+        # Update toggle label to show ON/OFF status
+        def update_toggle_label():
+            if tile_state_lbl is not None:
+                tile_state_lbl.set_text(_("On") if tbtn.get_active() else _("Off"))
+                return
+            if tbtn.get_style_context().has_class("cc-has-icon"):
+                return  # icon toggles keep their icon and name
+            if tbtn.get_active():
+                tbtn.set_label(_("ON"))
+            else:
+                tbtn.set_label(_("OFF"))
+
+        # Track if we're currently updating from user action to prevent refresh conflicts
+        toggle_state = {"updating": False, "last_user_change": 0}
+
+        if status_cmd:
+            # Defer initial value to idle for faster startup
+            def set_initial():
+                initial_val = run_shell_capture_cached(status_cmd)
+                initial_active = normalize_bool_str(initial_val)
+                tbtn.set_active(initial_active)
+                return False
+            GLib.idle_add(set_initial)
+            update_toggle_label()
+
+            def upd(val: str, _lbl=status_lbl, _tb=tbtn):
+                import time
+                # Don't update if we just changed it (within 1 second)
+                if time.time() - toggle_state["last_user_change"] < 1.0:
+                    return
+
+                txt = (val or "").strip()
+                if _lbl:
+                    _lbl.set_text(txt)
+                active = normalize_bool_str(txt)
+
+                # Only update if different and not currently updating
+                if not toggle_state["updating"] and _tb.get_active() != active:
+                    toggle_state["updating"] = True
+                    _tb.set_active(active)
+                    update_toggle_label()
+                    toggle_state["updating"] = False
+
+            self.refreshers.append(RefreshTask(upd, status_cmd, refresh))
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            if element_id:
+                self.refreshfunctionsbyids[element_id] = {"function": upd}
+        else:
+            # If no status command, just show ON/OFF based on initial state
+            update_toggle_label()
+
+        def on_toggled(_w):
+            import time
+            # Ignore toggle events triggered by refresh updates
+            if toggle_state["updating"]:
+                return
+
+            update_toggle_label()
+            key = f"toggle:{parent_label or 'toggle'}"
+            if not self.debouncer.allow(key):
+                return
+
+            # Mark that user just changed it
+            toggle_state["last_user_change"] = time.time()
+
+            act = action_on if tbtn.get_active() else action_off
+            if act:
+                def run_toggle_action():
+                    run_shell_capture(act, get_output = False)
+                    # Run afterclick if specified
+                    if afterclick:
+                        handle_afterclick_after(self, afterclick)
+                    if update_ids:
+                        handle_update_ids(self, update_ids)
+                if afterclick:
+                    handle_afterclick_before(self, afterclick)
+                run_off_main_thread(run_toggle_action)
+
+        tbtn.connect("toggled", on_toggled)
+        
+        # Add touchscreen synchronization
+        self.add_touch_sync_to_widget(tbtn)
+
+        # Register ID for toggles (they always produce visual content)
+        register_element_id(sub, self.rendered_ids)
+
+        return tbtn
+
+    def build_switch(self, parent_feat, sub, row_box, pack_end=False):
+        """Build a switch widget (GtkSwitch) - same functionality as toggle but different appearance"""
+        
+        parent_label = (parent_feat.attrs.get("display", "") or parent_feat.attrs.get("name", "") or "").strip()
+        switch_display = (sub.attrs.get("display", "") or "").strip()
+        
+        # Use switch display if provided, otherwise use parent label
+        label_text = switch_display or parent_label
+        
+        # Create switch widget
+        switch = Gtk.Switch()
+        switch.get_style_context().add_class("cc-switch")
+        switch.set_can_focus(True)
+        switch.set_valign(Gtk.Align.CENTER)
+        
+        # Apply ID as widget name for CSS
+        elem_id = (sub.attrs.get("id", "") or "").strip()
+        if elem_id:
+            switch.set_name(elem_id)
+        
+        # Add to row box
+        if pack_end:
+            row_box.pack_end(switch, False, False, 6)
+        else:
+            row_box.pack_start(switch, False, False, 6)
+        
+        # Get actions and value
+        action_on = (sub.attrs.get("action_on", "") or "").strip()
+        action_off = (sub.attrs.get("action_off", "") or "").strip()
+        afterclick = sub.attrs.get("afterclick", "")
+        update_ids = xmlattr_to_set(sub.attrs.get("updateids", ""))
+        value_cmd = (sub.attrs.get("value", "") or "").strip()
+        refresh = float(sub.attrs.get("refresh", parent_feat.attrs.get("refresh", DEFAULT_REFRESH_SEC)))
+        
+        # Handle dynamic visibility for id() and !id() conditions
+        if_condition = (sub.attrs.get("if", "") or "").strip()
+        if if_condition:
+            # Track this widget for dynamic visibility updates
+            self._conditional_widgets.append((switch, if_condition))
+            # Don't initially hide - let the condition be evaluated normally
+        
+        # Always show switch initially to prevent blinking
+        switch.set_visible(True)
+        
+        # Store last state to avoid unnecessary updates and track user interactions
+        last_state = [None]  # Use list to make it mutable in nested function
+        switch_state = {"updating": False, "last_user_change": 0}
+        
+        def update_switch_state(val):
+            """Update switch state based on command output"""
+            try:
+                import time
+                # Don't update if we just changed it (within 1 second)
+                if time.time() - switch_state["last_user_change"] < 1.0:
+                    return
+                
+                # Handle both string and boolean values
+                if isinstance(val, bool):
+                    is_on = val
+                else:
+                    normalized = normalize_bool_str(val)
+                    is_on = normalized
+                
+                # Check if state actually changed to avoid unnecessary updates and blinking
+                if last_state[0] is not None and last_state[0] == is_on:
+                    return  # No change, don't update
+                
+                last_state[0] = is_on
+                
+                # Only update if state actually changed and not currently updating
+                if not switch_state["updating"] and switch.get_active() != is_on:
+                    switch_state["updating"] = True
+                    switch.set_active(is_on)
+                    switch.set_state(is_on)  # Also set the state for GtkSwitch
+                    switch_state["updating"] = False
+                
+                # Don't change visibility - keep switch always visible once created
+                # Register ID when content is present
+                register_element_id(sub, self.rendered_ids)
+                
+            except Exception as e:
+                debug_print(f"[SWITCH] Error updating switch state: {e}")
+                last_state[0] = None
+        
+        def on_switch_toggled(_switch, state):
+            """Handle switch toggle events"""
+            try:
+                import time
+                # Ignore switch events triggered by refresh updates
+                if switch_state["updating"]:
+                    return False  # Return False to allow the state change
+                
+                self.reset_inactivity_timer()  # Reset timer on interaction
+                
+                # Mark that user just changed it
+                switch_state["last_user_change"] = time.time()
+                
+                def run_switch_action(action):
+                    if afterclick:
+                        handle_afterclick_before(self, afterclick)
+                    run_shell_capture(action, get_output = False)
+                    # Run afterclick if specified
+                    if afterclick:
+                        handle_afterclick_after(self, afterclick)
+                    if update_ids:
+                        handle_update_ids(self, update_ids)
+                
+                if state and action_on:
+                    if self.debouncer.allow(f"switch_on:{action_on}"):
+                        run_off_main_thread(lambda: run_switch_action(action_on))
+                elif not state and action_off:
+                    if self.debouncer.allow(f"switch_off:{action_off}"):
+                        run_off_main_thread(lambda: run_switch_action(action_off))
+                
+                return False  # Return False to allow the state change
+            except Exception as e:
+                print(f"[SWITCH] Error in switch toggle handler: {e}")
+                return False
+        
+        # Connect the switch signal - use "state-set" for GtkSwitch
+        switch.connect("state-set", on_switch_toggled)
+        
+        # Add touchscreen synchronization
+        self.add_touch_sync_to_widget(switch)
+        
+        # Set up value monitoring if provided
+        if is_cmd(value_cmd):
+            c = cmd_of(value_cmd)
+            
+            # Get initial state
+            initial_val = run_shell_capture_cached(c).strip()
+            if initial_val:
+                update_switch_state(initial_val)
+            # Don't hide switch if no initial value - keep it visible
+            
+            def upd(val: str, _switch=switch, _sub=sub, _core=self):
+                txt = (val or "").strip()
+                if txt and txt.lower() != "null":
+                    update_switch_state(txt)
+                    # Don't change visibility - keep switch always visible
+                    register_element_id(_sub, _core.rendered_ids)
+                # Don't hide switch on empty values to prevent blinking
+            
+            self.refreshers.append(RefreshTask(upd, c, refresh))
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            if element_id:
+                self.refreshfunctionsbyids[element_id] = {"function": upd}
+        
+        elif value_cmd:
+            # Static value
+            update_switch_state(value_cmd)
+        else:
+            # No value command - switch starts in off state but is functional
+            switch.set_active(False)
+            register_element_id(sub, self.rendered_ids)
+        
+        return switch
+
+    def build_tab(self, parent_feat, sub, row_box, pack_end=False):
+        """Build a tab button that controls content visibility"""
+        text = (sub.attrs.get("display", "") or "Tab").strip()
+        target = (sub.attrs.get("target", "") or "").strip()
+
+        # Tab is a toggle button that looks selected when active
+        tab_btn = Gtk.ToggleButton.new_with_label(_(text))
+        tab_btn.get_style_context().add_class("cc-tab")
+        tab_btn.set_can_focus(True)
+        _apply_icon(tab_btn, _(text), sub)
+
+        # Store target ID for content switching
+        tab_btn._tab_target = target
+
+        # Get alignment from attribute (default: center)
+        align_attr = (sub.attrs.get("align", "center") or "center").strip().lower()
+        if align_attr == "left":
+            tab_btn.set_halign(Gtk.Align.START)
+        elif align_attr == "right":
+            tab_btn.set_halign(Gtk.Align.END)
+        else:  # center (default)
+            tab_btn.set_halign(Gtk.Align.CENTER)
+
+        (row_box.pack_end if pack_end else row_box.pack_start)(tab_btn, False, False, 3)
+
+        # Handle dynamic visibility for id() and !id() conditions
+        if_condition = (sub.attrs.get("if", "") or "").strip()
+        if if_condition:
+            # Track this widget for dynamic visibility updates
+            self._conditional_widgets.append((tab_btn, if_condition))
+            debug_print(f"[TAB] added conditional widget for {target}")
+            # Initially hide, will be shown after IDs are registered
+            tab_btn._cond_visible = False
+            tab_btn.set_visible(False)
+
+        # Register ID for tabs (they always produce visual content)
+        register_element_id(sub, self.rendered_ids)
+
+        return tab_btn
+
+
+    def build_doc(self, parent_feat, sub, row_box, pack_end=False):
+        """Build a button that opens a document viewer, without initial flash when content is empty,
+        and dynamically integrates with controller focus when added/removed."""
+        name = (sub.attrs.get("display", "") or "View").strip()
+        content = (sub.attrs.get("content", "") or "").strip()
+        refresh = float(sub.attrs.get("refresh", parent_feat.attrs.get("refresh", DEFAULT_REFRESH_SEC)))
+
+        align_attr = (sub.attrs.get("align", "center") or "center").strip().lower()
+
+        # Holds the current button and path; both start absent
+        state = {
+            "btn": None,     # Gtk.Button or None
+            "path": None     # str or None
+        }
+
+        # Determine navigation context: are we inside a feature row (left/right with _items),
+        # or inside a focusable vgroup/hgroup cell (cell_controls)?
+        # We try to find the nearest EventBox (cell) by walking up the parents of row_box.
+        def find_cell_eventbox(widget):
+            w = widget
+            try:
+                while w is not None:
+                    if isinstance(w, Gtk.EventBox) and hasattr(w, "get_style_context") and "vgroup-cell" in w.get_style_context().list_classes():
+                        return w
+                    w = w.get_parent()
+            except Exception:
+                pass
+            return None
+
+        # Feature row is two levels up: row_box belongs to a Gtk.EventBox row created by _build_feature_row
+        feature_row = None
+        try:
+            p = row_box.get_parent()
+            if isinstance(p, Gtk.EventBox):
+                feature_row = p
+        except Exception:
+            feature_row = None
+
+        cell_ev = find_cell_eventbox(row_box)
+
+        def add_to_navigation(btn: Gtk.Button):
+            """Add button to controller navigation structures based on context."""
+            try:
+                # Feature row: add to _items for left/right selection
+                if feature_row is not None:
+                    if not hasattr(feature_row, "_items"):
+                        feature_row._items = []
+                        feature_row._item_index = 0
+                    feature_row._items.append(btn)
+                # Cell context: add into its controls list so row focus can navigate within the cell
+                if cell_ev is not None:
+                    if not hasattr(cell_ev, "_control_index"):
+                        cell_ev._control_index = 0
+                    # Find the tuple (cell_event, controls) in the parent row._cells
+                    # The parent row is the EventBox that owns the cell_ev.
+                    parent_row = None
+                    rp = cell_ev.get_parent()
+                    while rp is not None and not isinstance(rp, Gtk.EventBox):
+                        rp = rp.get_parent()
+                    if isinstance(rp, Gtk.EventBox) and hasattr(rp, "_cells"):
+                        parent_row = rp
+                    if parent_row:
+                        for i, (cev, controls) in enumerate(parent_row._cells):
+                            if cev is cell_ev:
+                                controls.append(btn)
+                                # Mark row as selectable if it wasn’t
+                                if not hasattr(parent_row, "_on_activate"):
+                                    parent_row._on_activate = None
+                                # Ensure row is registered (it already is if _cells exists)
+                                break
+            except Exception:
+                pass
+
+        def remove_from_navigation(btn: Gtk.Button):
+            """Remove button from controller navigation structures."""
+            try:
+                if feature_row is not None and hasattr(feature_row, "_items"):
+                    if btn in feature_row._items:
+                        feature_row._items.remove(btn)
+                        # Clamp index
+                        if hasattr(feature_row, "_item_index"):
+                            feature_row._item_index = max(0, min(len(feature_row._items) - 1, feature_row._item_index))
+                if cell_ev is not None:
+                    parent_row = None
+                    rp = cell_ev.get_parent()
+                    while rp is not None and not isinstance(rp, Gtk.EventBox):
+                        rp = rp.get_parent()
+                    if isinstance(rp, Gtk.EventBox) and hasattr(rp, "_cells"):
+                        parent_row = rp
+                    if parent_row:
+                        for i, (cev, controls) in enumerate(parent_row._cells):
+                            if cev is cell_ev and btn in controls:
+                                controls.remove(btn)
+                                # Clamp control index
+                                if hasattr(cev, "_control_index"):
+                                    cev._control_index = max(0, min(len(controls) - 1, cev._control_index))
+                                break
+            except Exception:
+                pass
+
+        def make_button():
+            """Create and pack the button with proper styling; do not call show explicitly."""
+            btn = Gtk.Button.new_with_label(_(name))
+            btn.get_style_context().add_class("cc-button")
+            btn.set_can_focus(True)
+            _apply_icon(btn, _(name), sub)
+
+            if align_attr == "left":
+                btn.set_halign(Gtk.Align.START)
+            elif align_attr == "right":
+                btn.set_halign(Gtk.Align.END)
+            else:
+                btn.set_halign(Gtk.Align.CENTER)
+
+            (row_box.pack_end if pack_end else row_box.pack_start)(btn, False, False, 6)
+            # Integrate into navigation now that it's packed
+            add_to_navigation(btn)
+            return btn
+
+        def open_doc_viewer(file_path: str):
+            if not file_path:
+                return
+            self._dialog_open = True
+            self._about_to_show_dialog = True
+            self.disable_timer()
+            self._suspend_inactivity_timer = True
+            try:
+                def docviewer_on_destroy():
+                    # Resume inactivity timer
+                    self.reset_inactivity_timer()
+                    self._suspend_inactivity_timer = False
+                    self._dialog_open = False
+                    self._handle_gamepad_action = self._handle_gamepad_action_main
+                    # Disable continuous actions when returning to main window
+                    self.disable_gamepad_continuous_actions()
+
+                def docviewer_on_quit():
+                    self.quit()
+
+                docviewer = DocViewer(self._is_wayland)
+                docviewer.open(self.window, file_path, docviewer_on_destroy, docviewer_on_quit)
+                self._handle_gamepad_action = docviewer.handle_gamepad_action
+                # Enable continuous actions for document viewer navigation
+                self.enable_gamepad_continuous_actions()
+                self._about_to_show_dialog = False
+            except Exception as e:
+                self._dialog_open = False
+                debug_print(f"[DOCVIEW] Exception: {e}")
+
+        def connect_click(btn):
+            btn.connect("clicked", lambda *_: (open_doc_viewer(state["path"]) if state["path"] else None))
+
+        def register_or_unregister_id(visible: bool):
+            if visible:
+                register_element_id(sub, self.rendered_ids)
+            else:
+                elem_id = sub.attrs.get("id", "").strip()
+                if elem_id and elem_id in self.rendered_ids:
+                    self.rendered_ids.discard(elem_id)
+
+        def ensure_button_visible(path: str):
+            """Ensure button exists and is visible with a valid path, and part of navigation."""
+            # Create the button if it doesn't exist yet
+            if state["btn"] is None:
+                btn = make_button()
+                state["btn"] = btn
+                connect_click(btn)
+            # Show and register ID
+            state["btn"].set_visible(True)
+            register_or_unregister_id(True)
+            state["path"] = path
+
+        def ensure_button_absent():
+            """Ensure button is removed and ID is unregistered, and navigation is updated."""
+            state["path"] = None
+            register_or_unregister_id(False)
+            if state["btn"] is not None:
+                # Remove from navigation first
+                remove_from_navigation(state["btn"])
+                # Remove the button from the row to avoid any flash on subsequent show_all calls
+                try:
+                    if state["btn"].get_parent() is row_box:
+                        row_box.remove(state["btn"])
+                except Exception:
+                    pass
+                state["btn"] = None
+
+        # Static content
+        if content and not is_cmd(content):
+            path = content.strip()
+            if not path or path.lower() == "null":
+                # Do not create or pack any button → no flash and no navigation entry
+                return None
+            # Valid at startup: create and show button, add to navigation
+            ensure_button_visible(path)
+            return state["btn"]
+
+        # Dynamic content via ${...}
+        if is_cmd(content):
+            c = cmd_of(content)
+
+            # Initial evaluation before creating any widget
+            initial_path = run_shell_capture_cached(c).strip()
+            if not initial_path or initial_path.lower() == "null":
+                # Keep absent → no flash, no navigation
+                state["path"] = None
+            else:
+                ensure_button_visible(initial_path)
+
+            # Refresh task toggles presence cleanly
+            def upd(val: str):
+                path = (val or "").strip()
+                if path and path.lower() != "null":
+                    # Ensure button exists and is visible with updated path
+                    ensure_button_visible(path)
+                else:
+                    # Remove button and unregister ID
+                    ensure_button_absent()
+
+            self.refreshers.append(RefreshTask(lambda v, f=upd: f(v), c, refresh))
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            if element_id:
+                self.refreshfunctionsbyids[element_id] = {"function": upd}
+            # Return button (may be None if initial path invalid)
+            return state["btn"]
+
+        # No content provided → do not render
+        return None
+
+
+    def build_img(self, parent_feat, sub, row_box, pack_end=False):
+        """Build an image widget from file path, URL, or ${...} command (supports animated GIFs with CPU optimization)"""
+        import urllib.request
+        from gi.repository import GdkPixbuf
+
+        disp = (sub.attrs.get("display", "") or "").strip()
+        width = sub.attrs.get("width", "")
+        height = sub.attrs.get("height", "")
+        refresh = float(sub.attrs.get("refresh", parent_feat.attrs.get("refresh", DEFAULT_REFRESH_SEC)))
+        
+        # Check if animations are enabled (can be disabled per-image or globally)
+        enable_animation = sub.attrs.get("animate", "true").lower() in ("true", "1", "yes")
+        enable_animation = enable_animation and self._enable_gif_animations
+
+        reference_width, reference_height = self.get_reference_dimensions()
+
+        target_width = parse_dimension(width, reference_width)
+        target_height = parse_dimension(height, reference_height)
+
+        img = Gtk.Image()
+
+        # Set size request if dimensions are specified to ensure consistent sizing
+        if target_width or target_height:
+            img.set_size_request(target_width or -1, target_height or -1)
+
+        # Get alignment from attribute (default: center)
+        align_attr = (sub.attrs.get("align", "center") or "center").strip().lower()
+        if align_attr == "left":
+            img.set_halign(Gtk.Align.START)
+        elif align_attr == "right":
+            img.set_halign(Gtk.Align.END)
+        else:  # center (default)
+            img.set_halign(Gtk.Align.CENTER)
+
+        (row_box.pack_end if pack_end else row_box.pack_start)(img, False, False, 6)
+
+        if_condition = (sub.attrs.get("if", "") or "").strip()
+        if if_condition:
+            # Track this widget for dynamic visibility updates
+            self._conditional_widgets.append((img, if_condition))
+            # Do NOT rely on should_render_element for <img>; we control visibility here
+            # Start with it hidden; _recompute_conditionals will decide
+            img._cond_visible = False
+            img.set_visible(False)
+        else:
+            img.set_visible(True)
+
+        # Register ID for img elements (they always produce visual content)
+        register_element_id(sub, self.rendered_ids)
+
+        def is_gif(path_or_url: str) -> bool:
+            """Check if the path/URL points to a GIF file"""
+            return path_or_url.lower().endswith('.gif')
+
+        def load_image(path_or_url: str):
+            """Load image from file path or URL (supports animated GIFs)"""
+            try:
+                path_or_url = path_or_url.strip()
+                if not path_or_url:
+                    return None, None
+
+                pixbuf = None
+                animation = None
+
+                # Check if it's a URL
+                if path_or_url.startswith(("http://", "https://")):
+                    # Download from URL
+                    with urllib.request.urlopen(path_or_url, timeout=5) as response:
+                        data = response.read()
+                        
+                        if is_gif(path_or_url) and enable_animation:
+                            # Load as animation for GIFs
+                            loader = GdkPixbuf.PixbufLoader()
+                            loader.write(data)
+                            loader.close()
+                            animation = loader.get_animation()
+                            if animation and not animation.is_static_image():
+                                # It's an animated GIF
+                                pixbuf = None
+                            else:
+                                # It's a static GIF, treat as regular image
+                                pixbuf = loader.get_pixbuf()
+                                animation = None
+                        else:
+                            # Load as static image
+                            loader = GdkPixbuf.PixbufLoader()
+                            loader.write(data)
+                            loader.close()
+                            pixbuf = loader.get_pixbuf()
+                else:
+                    # Load from file
+                    if os.path.exists(path_or_url):
+                        if is_gif(path_or_url) and enable_animation:
+                            # Try to load as animation first
+                            animation = GdkPixbuf.PixbufAnimation.new_from_file(path_or_url)
+                            if animation and animation.is_static_image():
+                                # It's a static GIF, get the static image
+                                pixbuf = animation.get_static_image()
+                                animation = None
+                        else:
+                            # Load as static image (or animation disabled)
+                            if is_gif(path_or_url):
+                                # Load first frame only
+                                animation = GdkPixbuf.PixbufAnimation.new_from_file(path_or_url)
+                                pixbuf = animation.get_static_image()
+                                animation = None
+                            else:
+                                pixbuf = GdkPixbuf.Pixbuf.new_from_file(path_or_url)
+
+                # Scale static images if needed
+                if pixbuf:
+                    orig_width = pixbuf.get_width()
+                    orig_height = pixbuf.get_height()
+
+                    if target_width and target_height:
+                        # Both specified
+                        pixbuf = pixbuf.scale_simple(target_width, target_height, GdkPixbuf.InterpType.BILINEAR)
+                    elif target_width:
+                        # Only width specified, maintain aspect ratio
+                        aspect = orig_height / orig_width
+                        new_height = int(target_width * aspect)
+                        pixbuf = pixbuf.scale_simple(target_width, new_height, GdkPixbuf.InterpType.BILINEAR)
+                    elif target_height:
+                        # Only height specified, maintain aspect ratio
+                        aspect = orig_width / orig_height
+                        new_width = int(target_height * aspect)
+                        pixbuf = pixbuf.scale_simple(new_width, target_height, GdkPixbuf.InterpType.BILINEAR)
+
+                return pixbuf, animation
+            except Exception as e:
+                debug_print(f"[IMG] Error loading image from '{path_or_url}': {e}")
+            return None, None
+
+        def update_image(path_or_url: str):
+            """Update the image widget (supports animated GIFs with CPU optimization)"""
+            def do_load():
+                pixbuf, animation = load_image(path_or_url)
+                
+                def set_image():
+                    # Clean up previous animation if any
+                    if hasattr(img, '_animation_timeout_id') and img._animation_timeout_id:
+                        try:
+                            GLib.source_remove(img._animation_timeout_id)
+                        except Exception:
+                            pass
+                        img._animation_timeout_id = None
+                    
+                    # Remove from active animations list
+                    if img in self._active_animations:
+                        self._active_animations.remove(img)
+                    
+                    if animation:
+                        # Store animation reference and scaling parameters
+                        img._animation = animation
+                        img._target_width = target_width
+                        img._target_height = target_height
+
+                        # Add to active animations list
+                        self._active_animations.append(img)
+                        
+                        # Start animation playback with FPS limiting and scaling
+                        if not self._animations_paused:
+                            self._start_animation_playback(img, animation, target_width, target_height)
+                        
+                    elif pixbuf:
+                        # Set static image
+                        img.set_from_pixbuf(pixbuf)
+                    else:
+                        # Clear image
+                        img.clear()
+                    return False
+                
+                GLib.idle_add(set_image)
+            
+            # Load via the shared worker pool (bounded concurrency, no per-image thread).
+            run_off_main_thread(do_load)
+
+        # Check if display is a command or static path
+        if is_cmd(disp):
+            # Dynamic image path from command
+            c = cmd_of(disp)
+            def upd(val: str, _img=img):
+                update_image(val)
+            self.refreshers.append(RefreshTask(upd, c, refresh))
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            if element_id:
+                self.refreshfunctionsbyids[element_id] = {"function": upd}
+        elif disp:
+            # Static image path - load immediately
+            update_image(disp)
+
+        return img
+
+    def build_qrcode(self, parent_feat, sub, row_box, pack_end=False):
+        """Build a QR code image widget from text, URL, or ${...} command"""
+        try:
+            import qrcode
+            from io import BytesIO
+            from gi.repository import GdkPixbuf
+        except ImportError:
+            # If qrcode library is not available, show error message
+            lbl = Gtk.Label(label="[qrcode library not installed]")
+            lbl.get_style_context().add_class("value")
+            (row_box.pack_end if pack_end else row_box.pack_start)(lbl, False, False, 6)
+            return lbl
+
+        disp = (sub.attrs.get("display", "") or "").strip()
+        width = sub.attrs.get("width", "")
+        height = sub.attrs.get("height", "")
+        refresh = float(sub.attrs.get("refresh", parent_feat.attrs.get("refresh", DEFAULT_REFRESH_SEC)))
+        qrcode_style = sub.attrs.get("style")
+        qrcode_logo = sub.attrs.get("logo")
+        qrcode_font = sub.attrs.get("font")
+        footer_text = sub.attrs.get("text")
+
+        reference_width, reference_height = self.get_reference_dimensions()
+
+        # Parse width/height - QR codes are square, so if only one dimension is specified, use it for both
+        # If neither is specified, default to 160x160
+        parsed_width = parse_dimension(width, reference_width)
+        parsed_height = parse_dimension(height, reference_height)
+        
+        if parsed_width and parsed_height:
+            target_width = parsed_width
+            target_height = parsed_height
+        elif parsed_width:
+            target_width = parsed_width
+            target_height = parsed_width  # Square
+        elif parsed_height:
+            target_width = parsed_height  # Square
+            target_height = parsed_height
+        else:
+            target_width = 160
+            target_height = 160
+
+        img = Gtk.Image()
+        # Set size request to ensure consistent sizing with regular images
+        img.set_size_request(target_width, target_height)
+
+        # Get alignment from attribute (default: center)
+        align_attr = (sub.attrs.get("align", "center") or "center").strip().lower()
+        if align_attr == "left":
+            img.set_halign(Gtk.Align.START)
+        elif align_attr == "right":
+            img.set_halign(Gtk.Align.END)
+        else:  # center (default)
+            img.set_halign(Gtk.Align.CENTER)
+
+        (row_box.pack_end if pack_end else row_box.pack_start)(img, False, False, 6)
+
+        def generate_qrcode(data: str, qrcode_style: str | None, qrcode_logo: str | None,
+                            qrcode_font: str | None, footer_text:str | None):
+            """Generate QR code from data string"""
+            try:
+                data = data.strip()
+                if not data or data == "null":
+                    return None
+
+                bg_hex = (parent_feat.attrs.get("bg", "") or sub.attrs.get("bg", "") or "#ffffff").strip()
+
+                def is_dark(hex_color: str) -> bool:
+                    hex_color = hex_color.lstrip('#')
+                    r = int(hex_color[0:2], 16) / 255.0
+                    g = int(hex_color[2:4], 16) / 255.0
+                    b = int(hex_color[4:6], 16) / 255.0
+
+                    def srgb_to_linear(c):
+                        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+                    R, G, B = map(srgb_to_linear, (r, g, b))
+                    luminance = 0.2126 * R + 0.7152 * G + 0.0722 * B
+                    return luminance < 0.5
+
+                dark_bg = is_dark(bg_hex)
+                fill_color = "white" if dark_bg else "black"
+
+                # Generate QR code
+                qr = qrcode.QRCode(
+                    version=1,
+                    error_correction=qrcode.constants.ERROR_CORRECT_L,
+                    box_size=10,
+                    border=0,
+                )
+                qr.add_data(data)
+                qr.make(fit=True)
+
+                # Create PIL image
+                pil_img = qr.make_image(fill_color=fill_color, back_color=bg_hex)
+
+                if qrcode_style == "card":
+                    pil_img = enchancementQr_card(pil_img, qrcode_style, qrcode_logo, qrcode_font, footer_text)
+
+                # Convert PIL image to pixbuf
+                buffer = BytesIO()
+                pil_img.save(buffer, format='PNG')
+                buffer.seek(0)
+
+                loader = GdkPixbuf.PixbufLoader.new_with_type('png')
+                loader.write(buffer.read())
+                loader.close()
+                pixbuf = loader.get_pixbuf()
+
+                # Scale to target size
+                if pixbuf:
+                    pixbuf = pixbuf.scale_simple(target_width, target_height, GdkPixbuf.InterpType.BILINEAR)
+                return pixbuf
+            except Exception as e:
+                debug_print(f"[QRCODE] Error generating QRcode for '{data}': {e}")
+                return None
+
+        def enchancementQr_card(qr_img, qrcode_style, qrcode_logo, qrcode_font, footer_text):
+            from PIL import Image, ImageDraw, ImageFont
+
+            img_width = 300
+            card_radius = int(img_width/14.0)
+            color_bg = (0, 0, 0)
+            border_size = 4
+            qr_border_size = border_size * 2
+            qr_width = img_width - border_size*2 - qr_border_size*2
+            resample = Image.LANCZOS
+            logo_height = qr_width // 4
+            footer_height = logo_height // 2
+            footer_border = footer_height // 3
+            footer_color = (150, 150, 200)
+            img_height = qr_width + border_size*2 + qr_border_size*2
+
+            if qrcode_logo:
+                img_height = img_height + logo_height
+
+            # init image
+            card_img = Image.new('RGBA', (img_width, img_height), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(card_img)
+
+            # background
+            draw.rounded_rectangle([0, 0, img_width, img_height], card_radius, fill=color_bg)
+
+            # logo
+            if qrcode_logo:
+                logo_raw = Image.open(qrcode_logo).convert("RGBA")
+                ratio = logo_height / logo_raw.height
+                logo_img = logo_raw.resize((int(logo_raw.width*ratio), logo_height), resample)
+                card_img.paste(logo_img, ((img_width - logo_img.width) // 2, border_size*2), logo_img)
+
+            # qr code
+            qr_img = qr_img.resize((qr_width, qr_width), resample)
+            qr_img = qr_img.convert("RGBA")
+            pos_x = border_size + qr_border_size
+            pos_y = border_size + qr_border_size
+            if qrcode_logo:
+                pos_y = pos_y + logo_height
+            card_img.paste(qr_img, (pos_x, pos_y), qr_img)
+
+            # footer
+            if qrcode_font and footer_text:
+                footer_font = ImageFont.truetype(qrcode_font, footer_height)
+                footer_width = draw.textlength(footer_text, font=footer_font)
+                draw.rounded_rectangle([(img_width-footer_width)//2-footer_border, img_height-footer_height-border_size,
+                                        (img_width+footer_width)//2+footer_border, img_height-border_size], 10, fill=(0,0,100))
+                draw.text(((img_width-footer_width)//2, img_height-footer_height-border_size), footer_text, fill=footer_color, font=footer_font)
+
+            # border
+            for i in range(border_size):
+                draw.rounded_rectangle([i, i, img_width-i, img_height-i], card_radius, outline=(200+i*5, 200+i*5, 220), width=1)
+
+            return card_img
+
+        def update_qrcode(data: str, qrcode_style: str | None, qrcode_logo: str | None,
+                          qrcode_font: str | None, footer_text: str | None):
+            """Update the QR code image widget"""
+            def do_generate():
+                pixbuf = generate_qrcode(data, qrcode_style, qrcode_logo, qrcode_font, footer_text)
+                if pixbuf:
+                    # Show and update image when valid data
+                    GLib.idle_add(lambda pb=pixbuf: (img.set_from_pixbuf(pb), img.set_visible(True)) or False)
+                else:
+                    # Hide when data is empty/null
+                    def hide():
+                        img.clear()
+                        img.set_visible(False)
+                        return False
+                    GLib.idle_add(hide)
+            run_off_main_thread(do_generate)
+
+        # Check if display is a command or static text
+        if is_cmd(disp):
+            # Dynamic QR code from command output
+            c = cmd_of(disp)
+
+            # Get initial value to check if we should render at all
+            initial_val = run_shell_capture_cached(c).strip()
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            
+            if not initial_val or initial_val.lower() == "null":
+                # Keep the widget hidden; allow later refresh to show it when valid
+                img.set_visible(False)
+            else:
+                # Initial render is valid
+                if element_id:
+                    register_element_id(sub, self.rendered_ids)
+                    self._recompute_conditionals()
+                update_qrcode(initial_val, qrcode_style, qrcode_logo, qrcode_font, footer_text)
+
+            def upd(val: str, _img=img, _sub=sub, _core=self, _qrcode_style=qrcode_style,
+                    _qrcode_logo=qrcode_logo, _qrcode_font=qrcode_font, _footer_text=footer_text):
+                txt = (val or "").strip()
+                element_id = (_sub.attrs.get("id", "") or "").strip()
+                
+                if txt and txt.lower() != "null":
+                    update_qrcode(txt, _qrcode_style, _qrcode_logo, _qrcode_font, _footer_text)
+                    # Only recompute if this element has an ID (affects conditionals)
+                    if element_id:
+                        register_element_id(_sub, _core.rendered_ids)
+                        GLib.idle_add(lambda: (_img.set_visible(True), _core.schedule_recompute_conditionals(), False)[2])
+                    else:
+                        GLib.idle_add(lambda: (_img.set_visible(True), False)[1])
+                else:
+                    # Clear, hide, and unregister ID when content disappears
+                    def hide_and_unregister():
+                        try:
+                            _img.clear()
+                        except:
+                            pass
+                        _img.set_visible(False)
+                        # Only recompute if this element had an ID that's being removed
+                        if element_id and element_id in _core.rendered_ids:
+                            _core.rendered_ids.discard(element_id)
+                            _core._recompute_conditionals()
+                        return False
+                    GLib.idle_add(hide_and_unregister)
+
+            self.refreshers.append(RefreshTask(upd, c, refresh))
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            if element_id:
+                self.refreshfunctionsbyids[element_id] = {"function": upd}
+
+            # Generate initial QR code
+            update_qrcode(initial_val, qrcode_style, qrcode_logo, qrcode_font, footer_text)
+
+        elif disp:
+            # Static QR code - generate immediately
+            if disp.strip() and disp.strip() != "null":
+                # Register ID immediately for static QR codes
+                register_element_id(sub, self.rendered_ids)
+                update_qrcode(disp, qrcode_style, qrcode_logo, qrcode_font, footer_text)
+            else:
+                # Don't render if empty
+                row_box.remove(img)
+                return None
+        else:
+            # No display value; do not render
+            row_box.remove(img)
+            return None
+
+        return img
+
+    def build_progressbar(self, parent_feat, sub, row_box, pack_end=False):
+        """Build a progress bar widget from value or ${...} command"""
+        
+        # Create container for progress bar with overlay text
+        container = Gtk.Overlay()
+        container.set_halign(Gtk.Align.CENTER)
+        
+        # Create progress bar
+        progress = Gtk.ProgressBar()
+        progress.get_style_context().add_class("cc-progressbar")
+        progress.set_show_text(False)  # We'll overlay our own text
+        
+        # Create text label for displaying the value (overlaid on progress bar)
+        text_label = Gtk.Label()
+        text_label.get_style_context().add_class("cc-progressbar-text")
+        text_label.set_xalign(0.5)  # Center the text horizontally
+        text_label.set_halign(Gtk.Align.CENTER)  # Center the label widget
+        text_label.set_valign(Gtk.Align.CENTER)  # Center vertically on the progress bar
+        
+        # Add progress bar as base layer
+        container.add(progress)
+        # Add text label as overlay
+        container.add_overlay(text_label)
+        
+        # Add to row box
+        if pack_end:
+            row_box.pack_end(container, False, False, 6)
+        else:
+            row_box.pack_start(container, False, False, 6)
+        
+        # Get min/max values (default to 0-100)
+        min_val = float(sub.attrs.get("min", "0"))
+        max_val = float(sub.attrs.get("max", "100"))
+        
+        # Ensure valid range
+        if max_val <= min_val:
+            max_val = min_val + 100
+        
+        # Apply ID as widget name for CSS
+        elem_id = (sub.attrs.get("id", "") or "").strip()
+        if elem_id:
+            progress.set_name(elem_id)
+            text_label.set_name(f"{elem_id}-text")
+        
+        # Get display value
+        disp = (sub.attrs.get("display", "") or "").strip()
+        refresh = float(sub.attrs.get("refresh", parent_feat.attrs.get("refresh", DEFAULT_REFRESH_SEC)))
+        
+        # Store last value to avoid unnecessary updates
+        last_value = [None]  # Use list to make it mutable in nested function
+        
+        def update_progress(value_str: str):
+            """Update the progress bar with a new value"""
+            try:
+                # Parse the value
+                value_str = value_str.strip()
+                if not value_str or value_str.lower() == "null":
+                    # Hide when no value
+                    container.set_visible(False)
+                    last_value[0] = None
+                    return
+                
+                # Try to parse as number
+                try:
+                    value = float(value_str)
+                except ValueError:
+                    # If not a number, try to extract number from string
+                    import re
+                    match = re.search(r'[-+]?\d*\.?\d+', value_str)
+                    if match:
+                        value = float(match.group())
+                    else:
+                        container.set_visible(False)
+                        last_value[0] = None
+                        return
+                
+                # Clamp value to range
+                value = max(min_val, min(max_val, value))
+                
+                # Check if value actually changed to avoid unnecessary updates
+                if last_value[0] is not None and abs(value - last_value[0]) < 0.5:  # Less than 0.5% change
+                    return
+                
+                last_value[0] = value
+                
+                # Calculate fraction (0.0 to 1.0)
+                new_fraction = (value - min_val) / (max_val - min_val) if max_val > min_val else 0.0
+                
+                # Update progress bar
+                progress.set_fraction(new_fraction)
+                
+                # Update text label - show the actual value with % symbol
+                if value == int(value):
+                    text_label.set_text(f"{int(value)}%")
+                else:
+                    text_label.set_text(f"{value:.1f}%")
+                
+                # Show container
+                container.set_visible(True)
+                
+            except Exception as e:
+                debug_print(f"[PROGRESS] Error updating progress bar: {e}")
+                container.set_visible(False)
+                last_value[0] = None
+        
+        # Handle dynamic visibility for id() and !id() conditions
+        if_condition = (sub.attrs.get("if", "") or "").strip()
+        if if_condition:
+            # Track this widget for dynamic visibility updates
+            self._conditional_widgets.append((container, if_condition))
+            # Initially hide, will be shown after IDs are registered
+            container._cond_visible = False
+            container.set_visible(False)
+        
+        # Check if display contains ${...} command substitution
+        if is_cmd(disp):
+            # Dynamic progress bar from command output
+            c = cmd_of(disp)
+            
+            # Get initial value to check if we should render at all
+            initial_val = run_shell_capture_cached(c).strip()
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            
+            if not initial_val or initial_val.lower() == "null":
+                # Keep the widget hidden; allow later refresh to show it when valid
+                container.set_visible(False)
+            else:
+                # Initial render is valid
+                if element_id:
+                    register_element_id(sub, self.rendered_ids)
+                    self._recompute_conditionals()
+                update_progress(initial_val)
+            
+            def upd(val: str, _container=container, _sub=sub, _core=self):
+                txt = (val or "").strip()
+                element_id = (_sub.attrs.get("id", "") or "").strip()
+                
+                if txt and txt.lower() != "null":
+                    update_progress(txt)
+                    # Only recompute if this element has an ID (affects conditionals)
+                    if element_id:
+                        register_element_id(_sub, _core.rendered_ids)
+                        GLib.idle_add(lambda: (_container.set_visible(True), _core.schedule_recompute_conditionals(), False)[2])
+                    else:
+                        GLib.idle_add(lambda: (_container.set_visible(True), False)[1])
+                else:
+                    # Hide and unregister ID when content disappears
+                    def hide_and_unregister():
+                        _container.set_visible(False)
+                        # Only recompute if this element had an ID that's being removed
+                        if element_id and element_id in _core.rendered_ids:
+                            _core.rendered_ids.discard(element_id)
+                            _core._recompute_conditionals()
+                        return False
+                    GLib.idle_add(hide_and_unregister)
+            
+            self.refreshers.append(RefreshTask(upd, c, refresh))
+            element_id = (sub.attrs.get("id", "") or "").strip()
+            if element_id:
+                self.refreshfunctionsbyids[element_id] = {"function": upd, "cmd": c}
+            
+            # Set initial value
+            update_progress(initial_val)
+            
+        elif disp:
+            # Static progress bar - set value immediately
+            if disp.strip() and disp.strip() != "null":
+                # Register ID immediately for static progress bars
+                register_element_id(sub, self.rendered_ids)
+                update_progress(disp)
+            else:
+                # Don't render if empty
+                row_box.remove(container)
+                return None
+        else:
+            # No display value; do not render
+            row_box.remove(container)
+            return None
+        
+        return container
+
+
+
+# ---- Builders for containers per new schema ----
+def ui_build_containers(core: UICore, xml_root):
+    win = core.build_window()
+    core.apply_css()
+
+    # Main container with header and scrollable content
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    outer.get_style_context().add_class("cc-outer")
+    win.add(outer)
+
+    # Header vgroups (role="header") — non-selectable, always visible
+    header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    
+    for child in xml_root.children:
+        if child.kind == "vgroup" and (child.attrs.get("role", "") or "").strip().lower() == "header":
+            if not should_render_element(child, core.rendered_ids):
+                continue
+            row = _build_vgroup_row(core, child, is_header=True)
+            if row:
+                header_box.pack_start(row, False, False, 0)
+
+    if header_box.get_children():
+        outer.pack_start(header_box, False, False, 0)
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.get_style_context().add_class("section-separator")
+        outer.pack_start(sep, False, False, 0)
+
+    # Scrollable content area - allow both horizontal and vertical scrolling
+    scrolled = Gtk.ScrolledWindow()
+    scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+    scrolled.set_propagate_natural_width(False)  # Don't let content expand window width
+    scrolled.set_propagate_natural_height(True)  # DO propagate height so window sizes correctly
+    # Set a reasonable minimum height for the scrolled area (with 80px room for header/footer)
+    available = max(300, core._max_height - 80)
+    scrolled.set_max_content_height(available)
+    outer.pack_start(scrolled, True, True, 0)
+    
+    # Store scrolled window reference for auto-scrolling
+    core._scrolled_window = scrolled
+
+    content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    scrolled.add(content_box)
+
+    # First pass: find tab rows and collect hgroup IDs
+    tab_targets = set()
+    for child in xml_root.children:
+        if child.kind == "feature":
+            # Check if this feature has tabs
+            has_tabs = any(sub.kind == "tab" for sub in child.children)
+            if has_tabs:
+                # Collect tab targets
+                for sub in child.children:
+                    if sub.kind == "tab":
+                        target = (sub.attrs.get("target", "") or "").strip()
+                        if target:
+                            tab_targets.add(target)
+
+    # Second pass: build ALL children in XML order (features, vgroups, hgroups)
+    tab_row = None
+    for child in xml_root.children:
+        if child.kind == "feature":
+            # Check if feature should be rendered based on 'if' condition
+            if should_render_element(child, core.rendered_ids):
+                fr = _build_feature_row(core, child)
+                if fr:
+                    content_box.pack_start(fr, False, False, 3)
+                    # Check if this is a tab row
+                    if hasattr(fr, '_tabs') and fr._tabs:
+                        tab_row = fr
+        elif child.kind == "vgroup":
+            role = (child.attrs.get("role", "") or "").strip().lower()
+            # Skip header and footer vgroups (they're processed separately)
+            if role in ("header", "footer"):
+                continue
+            vg = _build_vgroup_row(core, child, is_header=False)
+            if vg:
+                content_box.pack_start(vg, False, False, 0)
+        elif child.kind == "hgroup":
+            hgroup_id = (child.attrs.get("name", "") or child.attrs.get("display", "")).strip()
+            is_tab_content = hgroup_id in tab_targets
+
+            title = (child.attrs.get("display", "") or "").strip()
+            target = _get_group_container_new(core, content_box, title)
+
+            # If this is tab content, remove it from content_box (we'll add it back when tab is selected)
+            if is_tab_content:
+                # Get the frame (parent of target)
+                frame = target.get_parent()
+                if frame and frame.get_parent() == content_box:
+                    content_box.remove(frame)
+                    target._frame = frame  # Store frame for later re-insertion
+                    # Store content_box reference in tab_row for easy access
+                    if not hasattr(tab_row, '_content_box'):
+                        tab_row._content_box = content_box
+
+            # Process all children
+            has_multiple_vgroups_or_hgroups = sum(1 for s in child.children if s.kind in ("vgroup", "hgroup")) > 1
+
+            if has_multiple_vgroups_or_hgroups:
+                # For tab content, stack vgroups/hgroups vertically; otherwise arrange horizontally
+                if is_tab_content:
+                    # Vertical stacking for tab content
+                    for sub in child.children:
+                        if sub.kind == "vgroup":
+                            vg = _build_vgroup_row(core, sub, is_header=False)
+                            if vg:
+                                target.pack_start(vg, False, False, 0)
+                        elif sub.kind == "hgroup":
+                            # Nested hgroup in tab content - create vertical container with title
+                            vert_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+                            # Add title if present
+                            hgroup_title = (sub.attrs.get("display", "") or sub.attrs.get("name", "")).strip()
+                            if hgroup_title:
+                                title_label = Gtk.Label(label=_(hgroup_title))
+                                title_label.get_style_context().add_class("group-title")
+                                title_label.set_xalign(0.0)
+                                vert_box.pack_start(title_label, False, False, 0)
+
+                            # Process nested hgroup children
+                            for nested_sub in sub.children:
+                                if nested_sub.kind == "text":
+                                    text_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                                    core.build_text(sub, nested_sub, text_box, align_end=False)
+                                    vert_box.pack_start(text_box, False, False, 3)
+                                elif nested_sub.kind == "img":
+                                    img_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                                    core.build_img(sub, nested_sub, img_box, pack_end=False)
+                                    vert_box.pack_start(img_box, False, False, 3)
+                                elif nested_sub.kind == "feature":
+                                    # Check if feature should be rendered based on 'if' condition
+                                    if should_render_element(nested_sub, core.rendered_ids):
+                                        fr = _build_feature_row(core, nested_sub)
+                                        if fr:
+                                            vert_box.pack_start(fr, False, False, 3)
+
+                            target.pack_start(vert_box, False, False, 6)
+                        elif sub.kind == "img":
+                            # Direct img in tab content
+                            img_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                            img_box.set_halign(Gtk.Align.CENTER)
+                            core.build_img(child, sub, img_box, pack_end=False)
+                            target.pack_start(img_box, False, False, 6)
+                        elif sub.kind == "text":
+                            # Direct text in tab content
+                            text_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                            core.build_text(child, sub, text_box, align_end=False)
+                            target.pack_start(text_box, False, False, 6)
+                        elif sub.kind == "feature":
+                            # Direct feature in tab content
+                            # Check if feature should be rendered based on 'if' condition
+                            if should_render_element(sub, core.rendered_ids):
+                                fr = _build_feature_row(core, sub)
+                                if fr:
+                                    target.pack_start(fr, False, False, 3)
+                else:
+                    # Horizontal arrangement for non-tab content
+                    horiz_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+                    horiz_box.set_homogeneous(True)  # Make vgroups equal width for grid alignment
+                    target.pack_start(horiz_box, False, False, 0)
+
+                    for sub in child.children:
+                        if sub.kind == "vgroup":
+                            vg = _build_vgroup_row(core, sub, is_header=False)
+                            if vg:
+                                vg_box = vg.get_child()
+                                if vg_box:
+                                    vg_box.set_size_request(-1, -1)
+                                horiz_box.pack_start(vg, True, True, 6)
+                        elif sub.kind == "hgroup":
+                            # Nested hgroup - create vertical container with title
+                            vert_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+                            # Add title if present
+                            hgroup_title = (sub.attrs.get("display", "") or sub.attrs.get("name", "")).strip()
+                            if hgroup_title:
+                                title_label = Gtk.Label(label=_(hgroup_title))
+                                title_label.get_style_context().add_class("group-title")
+                                title_label.set_xalign(0.0)
+                                vert_box.pack_start(title_label, False, False, 0)
+
+                            for nested_sub in sub.children:
+                                if nested_sub.kind == "vgroup":
+                                    vg = _build_vgroup_row(core, nested_sub, is_header=False)
+                                    if vg:
+                                        vg_box = vg.get_child()
+                                        if vg_box:
+                                            vg_box.set_size_request(-1, -1)
+                                        vert_box.pack_start(vg, False, False, 0)
+                                elif nested_sub.kind == "feature":
+                                    # Check if feature should be rendered based on 'if' condition
+                                    if should_render_element(nested_sub, core.rendered_ids):
+                                        fr = _build_feature_row(core, nested_sub)
+                                        if fr:
+                                            fr_box = fr.get_child()
+                                            if fr_box:
+                                                fr_box.set_size_request(-1, -1)
+                                        vert_box.pack_start(fr, False, False, 3)
+                                elif nested_sub.kind == "text":
+                                    # Direct text in nested hgroup
+                                    text_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                                    core.build_text(sub, nested_sub, text_box, align_end=False)
+                                    vert_box.pack_start(text_box, False, False, 3)
+                                elif nested_sub.kind == "img":
+                                    img_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                                    core.build_img(sub, nested_sub, img_box, pack_end=False)
+                                    vert_box.pack_start(img_box, False, False, 3)
+                            horiz_box.pack_start(vert_box, True, True, 6)
+                        elif sub.kind == "img":
+                            # Direct img in hgroup horizontal layout
+                            img_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                            img_box.set_halign(Gtk.Align.CENTER)
+                            core.build_img(child, sub, img_box, pack_end=False)
+                            horiz_box.pack_start(img_box, True, True, 6)
+                        elif sub.kind == "text":
+                            # Direct text in hgroup horizontal layout
+                            text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                            core.build_text(child, sub, text_box, align_end=False)
+                            horiz_box.pack_start(text_box, True, True, 6)
+                        elif sub.kind == "feature":
+                            # Direct feature in hgroup horizontal layout
+                            # Check if feature should be rendered based on 'if' condition
+                            if should_render_element(sub, core.rendered_ids):
+                                fr = _build_feature_row(core, sub)
+                                if fr:
+                                    horiz_box.pack_start(fr, True, True, 6)
+            else:
+                for sub in child.children:
+                    if sub.kind == "vgroup":
+                        vg = _build_vgroup_row(core, sub, is_header=False)
+                        if vg:
+                            target.pack_start(vg, False, False, 0)
+                    elif sub.kind == "feature":
+                        # Check if feature should be rendered based on 'if' condition
+                        if should_render_element(sub, core.rendered_ids):
+                            fr = _build_feature_row(core, sub)
+                            if fr:
+                                target.pack_start(fr, False, False, 3)
+                    elif sub.kind == "text":
+                        text_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                        text_row.set_border_width(4)
+                        core.build_text(child, sub, text_row, align_end=False)
+                        target.pack_start(text_row, False, False, 3)
+                    elif sub.kind == "img":
+                        img_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                        img_row.set_border_width(4)
+                        img_row.set_halign(Gtk.Align.CENTER)  # Center the row itself
+                        core.build_img(child, sub, img_row, pack_end=False)
+                        target.pack_start(img_row, False, False, 3)
+                    elif sub.kind == "qrcode":
+                        qr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                        qr_row.set_border_width(4)
+                        core.build_qrcode(child, sub, qr_row, pack_end=False)
+                        target.pack_start(qr_row, False, False, 3)
+                    elif sub.kind == "progressbar":
+                        progress_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                        progress_row.set_border_width(4)
+                        core.build_progressbar(child, sub, progress_row, pack_end=False)
+                        target.pack_start(progress_row, False, False, 3)
+                    elif sub.kind == "doc":
+                        doc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                        doc_row.set_border_width(4)
+                        core.build_doc(child, sub, doc_row, pack_end=False)
+                        target.pack_start(doc_row, False, False, 3)
+
+            # If this is tab content, store it
+            if is_tab_content and tab_row:
+                if not hasattr(tab_row, '_tab_contents'):
+                    tab_row._tab_contents = {}
+                tab_row._tab_contents[hgroup_id] = target
+
+    win.connect("map", lambda *_: _init_focus(core))
+    win.show_all()
+    core._reapply_conditional_visibility()
+
+    # After show_all, find rows in tab content
+    if tab_row and hasattr(tab_row, '_tabs') and tab_row._tabs:
+        if hasattr(tab_row, '_tab_contents'):
+            # Find all rows that belong to each tab content
+            for content_id, content_widget in tab_row._tab_contents.items():
+                content_widget._tab_rows = []
+
+                # Find all registered rows inside this content
+                def find_rows_in_widget(widget, rows_list):
+                    if isinstance(widget, Gtk.EventBox) and widget in core.focus_rows:
+                        rows_list.append(widget)
+                    if hasattr(widget, 'get_children'):
+                        try:
+                            for child in widget.get_children():
+                                find_rows_in_widget(child, rows_list)
+                        except:
+                            pass
+
+                find_rows_in_widget(content_widget, content_widget._tab_rows)
+
+    win._tab_row = tab_row
+
+    # Footer vgroups at the bottom
+    footer_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+    for child in xml_root.children:
+        if child.kind == "vgroup" and (child.attrs.get("role", "") or "").strip().lower() == "footer":
+            row = _build_vgroup_row(core, child, is_header=True, is_footer=True)
+            if row:
+                row.get_style_context().add_class("footer-row")
+                footer_box.pack_start(row, True, True, 0)
+
+    if footer_box.get_children():
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.get_style_context().add_class("section-separator")
+        outer.pack_start(sep, False, False, 0)
+        outer.pack_start(footer_box, False, False, 0)
+        # Show footer widgets since they were added after win.show_all()
+        sep.show()
+        footer_box.show_all()
+        core._reapply_conditional_visibility()
+
+    return win
+
+
+def _init_focus(core: UICore):
+    if not core.focus_rows:
+        return
+    
+    # Properly clear all highlights from all rows (including item-level highlights)
+    for r in core.focus_rows:
+        core.unhighlight_row(r)
+    
+    # Check if we have a tab row and focus on it first
+    tab_row = None
+    if hasattr(core.window, '_tab_row') and core.window._tab_row:
+        tr = core.window._tab_row
+        if not getattr(tr, "_is_header_row", False):
+            tab_row = tr
+        # Find the tab row in focus_rows
+        for i, row in enumerate(core.focus_rows):
+            if row is tab_row:
+                core.focus_index = i
+                core._row_set_focused(tab_row, True)
+                _focus_widget(tab_row)
+                
+                # Focus on the first visible tab
+                if hasattr(tab_row, "_items") and tab_row._items:
+                    # Find first visible tab
+                    for j, tab in enumerate(tab_row._items):
+                        if hasattr(tab, 'is_visible') and tab.is_visible():
+                            tab_row._item_index = j
+                            if core.apply_focus_classes_if_allowed(tab):
+                                _focus_widget(tab)
+                            break
+                
+                # Auto-scroll to show the initially focused element
+                def delayed_scroll():
+                    core.scroll_to_focused_widget()
+                    return False
+                GLib.timeout_add(100, delayed_scroll)
+                return
+    
+    # Fallback: if no tab row found, focus on first content row
+    for i, row in enumerate(core.focus_rows):
+        if getattr(row, "_is_header_row", False):
+            continue   # skip header rows as init target
+        if not core._is_row_navigable(row):
+            continue   # hidden by an `if` condition
+        # Skip header rows without controls
+        if hasattr(row, "_cells") and row._cells:
+            # Check if this row has any controls
+            has_controls = any(controls for _, controls in row._cells)
+            if has_controls:
+                core.focus_index = i
+                core._row_set_focused(row, True)
+                _focus_widget(row)
+                core._apply_cell_highlight(row)
+                return
+        elif hasattr(row, "_items") and row._items:
+            # Row with items (buttons)
+            core.focus_index = i
+            core._row_set_focused(row, True)
+            _focus_widget(row)
+            if row._items:
+                row._item_index = 0
+                item = row._items[0]
+                if core.apply_focus_classes_if_allowed(item):
+                    _focus_widget(item)
+            return
+    
+    # Fallback: if no tab row found, focus on first content row
+    # Start with second row if available (skip potential header row)
+    # This helps avoid focusing on header elements like toggle buttons
+    if len(core.focus_rows) > 1:
+        core.focus_index = 1
+        target_row = core.focus_rows[1]
+    else:
+        core.focus_index = 0
+        target_row = core.focus_rows[0]
+    
+    core._row_set_focused(target_row, True)
+    _focus_widget(target_row)
+
+    # If target row has items, highlight the first one
+    if hasattr(target_row, "_items") and target_row._items:
+        if not hasattr(target_row, "_item_index"):
+            target_row._item_index = 0
+        item = target_row._items[target_row._item_index]
+        if core.apply_focus_classes_if_allowed(item):
+            _focus_widget(item)
+    
+    # Auto-scroll to show the initially focused element (with small delay for window to render)
+    def delayed_scroll():
+        core.scroll_to_focused_widget()
+        return False
+    GLib.timeout_add(100, delayed_scroll)
+
+
+def _get_group_container_new(core: UICore, parent_box: Gtk.Box, display_title: str):
+    title = (display_title or "").strip()
+    if title == "":
+        return parent_box
+    frame = Gtk.Frame()
+    frame.get_style_context().add_class("group-frame")
+    frame.set_shadow_type(Gtk.ShadowType.IN)
+    label = Gtk.Label(label=_(title))
+    label.get_style_context().add_class("group-title")
+    frame.set_label_widget(label)
+    inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    inner.set_border_width(6)
+    frame.add(inner)
+    parent_box.pack_start(frame, False, False, 0)
+    return inner
+
+
+def _build_vgroup_row(core: UICore, vg, is_header: bool, is_footer: bool = False) -> Gtk.EventBox:
+    row = Gtk.EventBox()
+    row._is_header_row = bool(is_header)
+    row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+    row.add(row_box)
+    row.set_above_child(False)
+    row.get_style_context().add_class("vgroup-row")
+
+    is_header_row = bool(is_header)
+    cell_expand = True
+
+    cells = []
+
+    # Group consecutive text children into a single vertical cell
+    i = 0
+    children_to_process = vg.children
+
+    while i < len(children_to_process):
+        child = children_to_process[i]
+
+        # Handle direct <text> children in vgroup
+        if child.kind == "text":
+            # Collect consecutive text children
+            text_children = [child]
+            j = i + 1
+            while j < len(children_to_process) and children_to_process[j].kind == "text":
+                text_children.append(children_to_process[j])
+                j += 1
+
+            # Create a single cell for all consecutive text children
+            cell_event = Gtk.EventBox()
+            cell_event.get_style_context().add_class("vgroup-cell")
+            if len(cells) == 0:
+                cell_event.get_style_context().add_class("vgroup-cell-first")
+
+            # Use vertical box if multiple text children
+            if len(text_children) > 1:
+                cell_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            else:
+                cell_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+            # Set cell_box alignment based on first text's align attribute
+            align_attr = (text_children[0].attrs.get("align", "center") or "center").strip().lower()
+            if align_attr == "left":
+                cell_box.set_halign(Gtk.Align.START)
+            elif align_attr == "right":
+                cell_box.set_halign(Gtk.Align.END)
+            else:
+                cell_box.set_halign(Gtk.Align.CENTER)
+            cell_event.add(cell_box)
+
+            # Build all text elements
+            for text_child in text_children:
+                if len(text_children) > 1:
+                    # For vertical stacking, create a horizontal box for each text
+                    text_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                    core.build_text(vg, text_child, text_box, align_end=False)
+                    cell_box.pack_start(text_box, False, False, 0)
+                else:
+                    core.build_text(vg, text_child, cell_box, align_end=False)
+
+            # Text-only cells have no controls, so they're not interactive
+            cells.append((cell_event, []))
+            row_box.pack_start(cell_event, cell_expand, cell_expand, 0)
+
+            i = j  # Skip the text children we just processed
+            continue
+
+        i += 1
+
+        # Handle direct <feature> children in vgroup
+        if child.kind == "feature":
+            if_cond = (child.attrs.get("if", "") or "").strip()
+            if if_cond and not should_render_element(child, core.rendered_ids):
+                continue
+
+            cell_event = Gtk.EventBox()
+            cell_event.get_style_context().add_class("vgroup-cell")
+            if len(cells) == 0:
+                cell_event.get_style_context().add_class("vgroup-cell-first")
+
+            cell_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            cell_event.add(cell_box)
+
+            # Track controls for navigation
+            cell_controls = []
+
+            # Dynamic visibility for ${...} conditions: register the cell like
+            # _build_feature_row does, so that the "if heartbeat" manages its visibility.
+            if if_cond:
+                core._conditional_widgets.append((cell_event, if_cond))
+                cell_event._cond_visible = False
+                cell_event.set_visible(False)
+
+            # Add feature label if present
+            label_text = (child.attrs.get("display", "") or child.attrs.get("name", "") or "").strip()
+            if label_text:
+                lbl = Gtk.Label(label=_(label_text))
+                lbl.get_style_context().add_class("header" if is_header_row else "item-text")
+                lbl.set_xalign(0.0)
+                cell_box.pack_start(lbl, False, False, 0)
+                # Register ID for features with labels
+                register_element_id(child, core.rendered_ids)
+
+            for sub in child.children:
+                # Let img/qrcode/progressbar/doc always be created; their own 'if' will control visibility
+                if sub.kind not in ("img", "qrcode", "progressbar", "doc", "button") and not should_render_element(sub, core.rendered_ids):
+                    continue
+                    
+                if sub.kind == "text":
+                    core.build_text(child, sub, cell_box, align_end=False)
+                elif sub.kind == "img":
+                    core.build_img(child, sub, cell_box, pack_end=False)
+                elif sub.kind == "qrcode":
+                    core.build_qrcode(child, sub, cell_box, pack_end=False)
+                elif sub.kind == "progressbar":
+                    core.build_progressbar(child, sub, cell_box, pack_end=False)
+                elif sub.kind == "doc":
+                    btn = core.build_doc(child, sub, cell_box, pack_end=False)
+                    if btn:
+                        btn.set_can_focus(True)
+                        cell_controls.append(btn)
+                elif sub.kind == "button":
+                    btn = core.build_button(child, sub, cell_box, pack_end=False)
+                    if btn:
+                        btn.set_can_focus(True)
+                        cell_controls.append(btn)
+                        # Add touchscreen synchronization
+                        core.add_touch_sync_to_widget(btn)
+                elif sub.kind == "button_confirm":
+                    text = (sub.attrs.get("display", "") or "Confirm?").strip()
+                    action = sub.attrs.get("action", "")
+                    afterclick = sub.attrs.get("afterclick", "")
+                    update_ids = xmlattr_to_set(sub.attrs.get("updateids", ""))
+                    btn = Gtk.Button.new_with_label(_(text))
+                    btn.get_style_context().add_class("cc-button")
+                    btn.get_style_context().add_class("cc-button-confirm")
+                    _apply_icon(btn, _(text), sub)
+                    btn.set_can_focus(True)
+                    cell_box.pack_start(btn, False, False, 6)
+                    def on_confirm_click(_w, _core=core, _text=text, _action=action, _afterclick=afterclick, _update_ids=update_ids):
+                        _core._about_to_show_dialog = True
+                        _show_confirm_dialog(_core, _text, _action, _afterclick, _update_ids)
+                        _core._about_to_show_dialog = False
+                    btn.connect("clicked", on_confirm_click)
+                    cell_controls.append(btn)
+                    # Add touchscreen synchronization
+                    core.add_touch_sync_to_widget(btn)
+                elif sub.kind == "toggle":
+                    tog = core.build_toggle(child, sub, cell_box, pack_end=False)
+                    tog.set_can_focus(True)
+                    cell_controls.append(tog)
+                    core.add_touch_sync_to_widget(tog)
+                elif sub.kind == "switch":
+                    switch = core.build_switch(child, sub, cell_box, pack_end=False)
+                    switch.set_can_focus(True)
+                    cell_controls.append(switch)
+                    core.add_touch_sync_to_widget(switch)
+
+            # Make cell focusable if it has controls
+            if cell_controls:
+                cell_event.set_can_focus(True)
+                cell_event.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.FOCUS_CHANGE_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+                cell_event._control_index = 0
+
+            cells.append((cell_event, cell_controls))
+            row_box.pack_start(cell_event, cell_expand, cell_expand, 0)
+            continue
+
+        # Handle direct <img> and <qrcode> children in vgroup
+        if child.kind in ("img", "qrcode"):
+            cell_event = Gtk.EventBox()
+            cell_event.get_style_context().add_class("vgroup-cell")
+            if len(cells) == 0:
+                cell_event.get_style_context().add_class("vgroup-cell-first")
+
+            cell_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            cell_event.add(cell_box)
+
+            # Build the img or qrcode element
+            if child.kind == "img":
+                core.build_img(vg, child, cell_box, pack_end=False)
+            else:  # qrcode
+                core.build_qrcode(vg, child, cell_box, pack_end=False)
+
+            # Img/qrcode-only cells have no controls, so they're not interactive
+            cells.append((cell_event, []))
+            row_box.pack_start(cell_event, cell_expand, cell_expand, 0)
+            continue
+
+        # Handle nested <vgroup> children in vgroup - treat as a cell
+        if child.kind == "vgroup":
+            cell_event = Gtk.EventBox()
+            cell_event.get_style_context().add_class("vgroup-cell")
+            if len(cells) == 0:
+                cell_event.get_style_context().add_class("vgroup-cell-first")
+
+            # Create a horizontal box to hold the nested vgroup's features inline
+            cell_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            cell_event.add(cell_box)
+
+            # Process nested vgroup's children inline
+            for nested_child in child.children:
+                # Handle direct text/img/qrcode children in nested vgroup
+                if nested_child.kind == "text":
+                    core.build_text(child, nested_child, cell_box, align_end=False)
+                    continue
+                elif nested_child.kind == "img":
+                    core.build_img(child, nested_child, cell_box, pack_end=False)
+                    continue
+                elif nested_child.kind == "qrcode":
+                    core.build_qrcode(child, nested_child, cell_box, pack_end=False)
+                    continue
+                elif nested_child.kind == "progressbar":
+                    core.build_progressbar(child, nested_child, cell_box, pack_end=False)
+                    continue
+
+                if nested_child.kind == "feature":
+                    # Check if feature should be rendered based on 'if' condition
+                    if not should_render_element(nested_child, core.rendered_ids):
+                        continue
+                        
+                    label_text = (nested_child.attrs.get("display", "") or nested_child.attrs.get("name", "") or "").strip()
+                    if label_text:
+                        lbl = Gtk.Label(label=_(label_text))
+                        lbl.get_style_context().add_class("item-text")
+                        lbl.set_xalign(0.0)
+                        cell_box.pack_start(lbl, False, False, 0)
+                        # Register ID for features with labels
+                        register_element_id(nested_child, core.rendered_ids)
+
+                    # Add feature children inline
+                    for sub in nested_child.children:
+                        if sub.kind not in ("img", "qrcode", "progressbar", "doc", "button") and not should_render_element(sub, core.rendered_ids):
+                            continue
+                        if sub.kind == "text":
+                            core.build_text(nested_child, sub, cell_box, align_end=False)
+                        elif sub.kind == "img":
+                            core.build_img(nested_child, sub, cell_box, pack_end=False)
+                        elif sub.kind == "qrcode":
+                            core.build_qrcode(nested_child, sub, cell_box, pack_end=False)
+                        elif sub.kind == "progressbar":
+                            core.build_progressbar(nested_child, sub, cell_box, pack_end=False)
+                        elif sub.kind == "doc":
+                            core.build_doc(nested_child, sub, cell_box, pack_end=False)
+
+            cells.append((cell_event, []))
+            row_box.pack_start(cell_event, cell_expand, cell_expand, 0)
+            continue
+
+        # Handle nested <hgroup> children in vgroup
+        if child.kind == "hgroup":
+            cell_event = Gtk.EventBox()
+            cell_event.get_style_context().add_class("vgroup-cell")
+            if len(cells) == 0:
+                cell_event.get_style_context().add_class("vgroup-cell-first")
+
+            cell_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            cell_event.add(cell_box)
+
+            # Track controls for navigation
+            cell_controls = []
+
+            # Process hgroup children (features, text, img, etc.)
+            for hg_child in child.children:
+                # Check if this child should be rendered
+                if hg_child.kind not in ("img", "qrcode", "progressbar", "doc", "button") and not should_render_element(hg_child, core.rendered_ids):
+                    continue
+
+                if hg_child.kind == "feature":
+                    # Check if feature should be rendered based on 'if' condition
+                    if not should_render_element(hg_child, core.rendered_ids):
+                        continue
+                        
+                    feat_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+                    label_text = (hg_child.attrs.get("display", "") or hg_child.attrs.get("name", "") or "").strip()
+                    if label_text:
+                        lbl = Gtk.Label(label=_(label_text))
+                        lbl.get_style_context().add_class("item-text")
+                        lbl.set_xalign(0.0)
+                        feat_box.pack_start(lbl, False, False, 0)
+                        # Register ID for features with labels
+                        register_element_id(hg_child, core.rendered_ids)
+
+                    # Add feature children
+                    for sub in hg_child.children:
+                        if sub.kind not in ("img", "qrcode", "progressbar", "doc", "button") and not should_render_element(sub, core.rendered_ids):
+                            continue
+                        if sub.kind == "text":
+                            core.build_text(hg_child, sub, feat_box, align_end=False)
+                        elif sub.kind == "img":
+                            core.build_img(hg_child, sub, feat_box, pack_end=False)
+                        elif sub.kind == "qrcode":
+                            core.build_qrcode(hg_child, sub, feat_box, pack_end=False)
+                        elif sub.kind == "progressbar":
+                            core.build_progressbar(hg_child, sub, feat_box, pack_end=False)
+                        elif sub.kind == "doc":
+                            btn = core.build_doc(hg_child, sub, feat_box, pack_end=False)
+                            if btn:
+                                btn.set_can_focus(True)
+                                cell_controls.append(btn)
+                        elif sub.kind == "button":
+                            btn = core.build_button(hg_child, sub, feat_box, pack_end=False)
+                            if btn:
+                                btn.set_can_focus(True)
+                                cell_controls.append(btn)
+                                
+                                # Add touchscreen synchronization
+                                core.add_touch_sync_to_widget(btn)
+                        elif sub.kind == "button_confirm":
+                            text = (sub.attrs.get("display", "") or "Confirm?").strip()
+                            action = sub.attrs.get("action", "")
+                            btn = Gtk.Button.new_with_label(_(text))
+                            btn.get_style_context().add_class("cc-button")
+                            btn.get_style_context().add_class("cc-button-confirm")
+                            _apply_icon(btn, _(text), sub)
+                            btn.set_can_focus(True)
+                            feat_box.pack_start(btn, False, False, 6)
+                            def on_confirm_click(_w, _core=core, _text=text, _action=action):
+                                _core._about_to_show_dialog = True
+                                _afterclick = sub.attrs.get("afterclick", "")
+                                _update_ids = xmlattr_to_set(sub.attrs.get("updateids", ""))
+                                _core._about_to_show_dialog = True; _show_confirm_dialog(_core, _text, _action, _afterclick, _update_ids); _core._about_to_show_dialog = False
+                                _core._about_to_show_dialog = False
+                            btn.connect("clicked", on_confirm_click)
+                            register_element_id(sub, core.rendered_ids)
+                            cell_controls.append(btn)
+                            
+                            # Add touchscreen synchronization
+                            core.add_touch_sync_to_widget(btn)
+
+                    cell_box.pack_start(feat_box, False, False, 3)
+                elif hg_child.kind == "text":
+                    core.build_text(child, hg_child, cell_box, align_end=False)
+                elif hg_child.kind == "img":
+                    core.build_img(child, hg_child, cell_box, pack_end=False)
+                elif hg_child.kind == "qrcode":
+                    core.build_qrcode(child, hg_child, cell_box, pack_end=False)
+                elif hg_child.kind == "progressbar":
+                    core.build_progressbar(child, hg_child, cell_box, pack_end=False)
+
+            # Make cell focusable if it has controls
+            if cell_controls:
+                cell_event.set_can_focus(True)
+                cell_event.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.FOCUS_CHANGE_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+                cell_event._control_index = 0
+
+                def on_cell_click(_w, *_args, _controls=cell_controls):
+                    if _controls:
+                        _focus_widget(_controls[0])
+                        _activate_widget(_controls[0])
+                cell_event.connect("button-press-event", on_cell_click)
+
+            cells.append((cell_event, cell_controls))
+            row_box.pack_start(cell_event, cell_expand, cell_expand, 0)
+            continue
+
+        if child.kind != "feature":
+            continue
+
+        cell_event = Gtk.EventBox()
+        cell_event.get_style_context().add_class("vgroup-cell")
+        if len(cells) == 0:
+            cell_event.get_style_context().add_class("vgroup-cell-first")
+
+        cell_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)  # Reduced spacing
+        cell_event.add(cell_box)
+
+        label_text = (child.attrs.get("display", "") or child.attrs.get("name", "") or "").strip()
+        if label_text:
+            lbl = Gtk.Label(label=_(label_text))
+            lbl.get_style_context().add_class("header" if is_header_row else "item-text")
+            # Don't ellipsize - let text show fully
+            lbl.set_xalign(0.0)
+            cell_box.pack_start(lbl, False, False, 0)
+            # Register ID for features with labels (they produce visual content)
+            register_element_id(child, core.rendered_ids)
+
+        cell_controls: list[Gtk.Widget] = []
+        for sub in child.children:
+            # Check if this sub-element should be rendered
+            if sub.kind not in ("img", "qrcode", "progressbar", "doc", "button") and not should_render_element(sub, core.rendered_ids):
+                continue
+
+            if sub.kind == "text":
+                core.build_text(child, sub, cell_box, align_end=False)
+            elif sub.kind == "img":
+                core.build_img(child, sub, cell_box, pack_end=False)
+            elif sub.kind == "qrcode":
+                core.build_qrcode(child, sub, cell_box, pack_end=False)
+            elif sub.kind == "progressbar":
+                core.build_progressbar(child, sub, cell_box, pack_end=False)
+            elif sub.kind == "hgroup":
+                # Nested hgroup in feature - create vertical layout
+                nested_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+                for hg_child in sub.children:
+                    if hg_child.kind == "text":
+                        core.build_text(child, hg_child, nested_box, align_end=False)
+                    elif hg_child.kind == "button":
+                        btn = core.build_button(child, hg_child, nested_box, pack_end=False)
+                        btn.set_can_focus(True)
+                        cell_controls.append(btn)
+                        
+                        # Add touchscreen synchronization
+                        core.add_touch_sync_to_widget(btn)
+                    elif hg_child.kind == "tab":
+                        tab = core.build_tab(child, hg_child, nested_box, pack_end=False)
+                        tab.set_can_focus(True)
+                        cell_controls.append(tab)
+                    elif hg_child.kind == "button_confirm":
+                        text = (hg_child.attrs.get("display", "") or "Confirm?").strip()
+                        action = hg_child.attrs.get("action", "")
+                        btn = Gtk.Button.new_with_label(_(text))
+                        btn.get_style_context().add_class("cc-button")
+                        btn.get_style_context().add_class("cc-button-confirm")
+                        _apply_icon(btn, _(text), hg_child)
+                        btn.set_can_focus(True)
+                        nested_box.pack_start(btn, False, False, 3)
+                        def on_confirm_click(_w, _core=core, _text=text, _action=action):
+                            _afterclick = hg_child.attrs.get("afterclick", "")
+                            _update_ids = xmlattr_to_set(hg_child.attrs.get("updateids", ""))
+                            _core._about_to_show_dialog = True; _show_confirm_dialog(_core, _text, _action, _afterclick, _update_ids); _core._about_to_show_dialog = False
+                        btn.connect("clicked", on_confirm_click)
+                        cell_controls.append(btn)
+                        
+                        # Add touchscreen synchronization
+                        core.add_touch_sync_to_widget(btn)
+                cell_box.pack_start(nested_box, False, False, 3)
+            elif sub.kind == "doc":
+                btn = core.build_doc(child, sub, cell_box, pack_end=False)
+                if btn:
+                    btn.set_can_focus(True)
+                    cell_controls.append(btn)
+            elif sub.kind == "button":
+                btn = core.build_button(child, sub, cell_box, pack_end=False)
+                btn.set_can_focus(True)
+                cell_controls.append(btn)
+                
+                # Add touchscreen synchronization
+                core.add_touch_sync_to_widget(btn)
+            elif sub.kind == "tab":
+                tab = core.build_tab(child, sub, cell_box, pack_end=False)
+                tab.set_can_focus(True)
+                cell_controls.append(tab)
+            elif sub.kind == "button_confirm":
+                text = (sub.attrs.get("display", "") or "Confirm?").strip()
+                action = sub.attrs.get("action", "")
+                btn = Gtk.Button.new_with_label(_(text))
+                btn.get_style_context().add_class("cc-button")
+                btn.get_style_context().add_class("cc-button-confirm")
+                _apply_icon(btn, _(text), sub)
+                btn.set_can_focus(True)
+                cell_box.pack_start(btn, False, False, 6)
+
+                def on_confirm_click(_w, _core=core, _text=text, _action=action):
+                    _afterclick = sub.attrs.get("afterclick", "")
+                    _update_ids = xmlattr_to_set(sub.attrs.get("updateids", ""))
+                    _core._about_to_show_dialog = True; _show_confirm_dialog(_core, _text, _action, _afterclick, _update_ids); _core._about_to_show_dialog = False
+
+                btn.connect("clicked", on_confirm_click)
+                cell_controls.append(btn)
+                
+                # Add touchscreen synchronization
+                core.add_touch_sync_to_widget(btn)
+            elif sub.kind == "toggle":
+                tog = core.build_toggle(child, sub, cell_box, pack_end=False)
+                tog.set_can_focus(True)
+                cell_controls.append(tog)
+                
+                # Add touchscreen synchronization
+                core.add_touch_sync_to_widget(tog)
+            elif sub.kind == "switch":
+                switch = core.build_switch(child, sub, cell_box, pack_end=False)
+                switch.set_can_focus(True)
+                cell_controls.append(switch)
+                
+                # Add touchscreen synchronization
+                core.add_touch_sync_to_widget(switch)
+
+        # Add choice button if feature has choice/choice_cmd children
+        choices = [c for c in child.children if c.kind in ("choice", "choice_cmd")]
+        if choices:
+            feature_label = label_text or "Option"
+            # Prewarm dynamic display="${...}" commands for the choices so the
+            # popup opens instantly (cache hit) instead of blocking on a
+            # subprocess the first time. For <choice_cmd>, also prewarm the
+            # action_arg command.
+            _pw_cmds = []
+            for _c in choices:
+                _pw_cmds.extend(extract_commands((_c.attrs.get("display", "") or "").strip()))
+                if _c.kind == "choice_cmd":
+                    _pw_cmds.extend(extract_commands((_c.attrs.get("action_arg", "") or "").strip()))
+            if _pw_cmds:
+                warm_shell_cache(_pw_cmds)
+            def open_choice(_core=core, _label=feature_label, _children=choices):
+                _core._about_to_show_dialog = True
+                _open_choice_popup(_core, _label, expand_choices(_children))
+                _core._about_to_show_dialog = False
+
+            choice_btn = Gtk.Button.new_with_label(_("Select"))
+            choice_btn.get_style_context().add_class("cc-button")
+            choice_btn.get_style_context().add_class("cc-choice")
+            choice_btn.set_can_focus(True)
+            choice_btn.set_size_request(70, -1)  # Fixed width like other buttons
+            choice_btn.set_hexpand(False)  # Prevent horizontal expansion
+            choice_btn.set_halign(Gtk.Align.END)  # Align to the right side
+            cell_box.pack_start(choice_btn, False, False, 6)
+            choice_btn.connect("clicked", lambda *_: open_choice())
+            cell_controls.append(choice_btn)
+            
+            # Add touchscreen synchronization
+            core.add_touch_sync_to_widget(choice_btn)
+
+        # Make cell focusable if it has interactive controls
+        # Allow header rows with controls to be focusable for controller navigation
+        if cell_controls:
+            cell_event.set_can_focus(True)
+            cell_event.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.FOCUS_CHANGE_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+
+            # Store control index for this cell
+            cell_event._control_index = 0
+
+            def on_cell_click(_w, *_args, _controls=cell_controls):
+                if _controls:
+                    _focus_widget(_controls[0])
+                    _activate_widget(_controls[0])
+            cell_event.connect("button-press-event", on_cell_click)
+
+        # Always add cell to row (even if no controls) for display
+        cells.append((cell_event, cell_controls))
+        row_box.pack_start(cell_event, cell_expand, cell_expand, 0)
+
+    # Check if row has any interactive controls
+    has_controls = any(controls for _, controls in cells)
+
+    # Set up navigation and focus handlers for rows with interactive controls
+    if has_controls:
+        row._cells = cells
+        # Find first cell with controls and set as initial index
+        row._cell_index = 0
+        for i, (cell_ev, controls) in enumerate(cells):
+            if controls:
+                row._cell_index = i
+                cell_ev._control_index = 0
+                break
+
+        def _clear_all_highlights():
+            """Remove all highlights from all cells and controls"""
+            for ev, controls in row._cells:
+                ev.get_style_context().remove_class("focused-cell")
+                for ctrl in controls:
+                    ctx = ctrl.get_style_context()
+                    ctx.remove_class("focused-cell")
+                    ctx.remove_class("choice-selected")
+
+        def _apply_current_highlight():
+            """Apply highlight to current control"""
+            cell_ev, controls = row._cells[row._cell_index]
+            if controls:
+                ctrl_idx = getattr(cell_ev, "_control_index", 0)
+                ctrl_idx = max(0, min(len(controls) - 1, ctrl_idx))
+                cell_ev._control_index = ctrl_idx
+
+                # Don't highlight the cell background, only the control
+                # cell_ev.get_style_context().add_class("focused-cell")
+
+                # Highlight only the current control
+                ctrl = controls[ctrl_idx]
+                if core.apply_focus_classes_if_allowed(ctrl, "cell-based"):
+                    _focus_widget(ctrl)
+
+        def on_row_left():
+            """Navigate to previous control (within cell or previous cell)"""
+            cell_ev, controls = row._cells[row._cell_index]
+            ctrl_idx = getattr(cell_ev, "_control_index", 0)
+
+            if ctrl_idx > 0:
+                # Move to previous control in same cell
+                _clear_all_highlights()
+                cell_ev._control_index = ctrl_idx - 1
+                _apply_current_highlight()
+            else:
+                # Move to previous cell with controls
+                new_cell_idx = row._cell_index - 1
+                while new_cell_idx >= 0:
+                    ev, controls = row._cells[new_cell_idx]
+                    if controls and core._is_widget_shown(ev):
+                        _clear_all_highlights()
+                        row._cell_index = new_cell_idx
+                        row._cells[new_cell_idx][0]._control_index = len(controls) - 1
+                        _apply_current_highlight()
+                        return
+                    new_cell_idx -= 1
+
+        def on_row_right():
+            """Navigate to next control (within cell or next cell)"""
+            cell_ev, controls = row._cells[row._cell_index]
+            ctrl_idx = getattr(cell_ev, "_control_index", 0)
+
+            if ctrl_idx < len(controls) - 1:
+                # Move to next control in same cell
+                _clear_all_highlights()
+                cell_ev._control_index = ctrl_idx + 1
+                _apply_current_highlight()
+            else:
+                # Move to next cell with controls
+                new_cell_idx = row._cell_index + 1
+                while new_cell_idx < len(row._cells):
+                    ev, controls = row._cells[new_cell_idx]
+                    if controls and core._is_widget_shown(ev):
+                        _clear_all_highlights()
+                        row._cell_index = new_cell_idx
+                        row._cells[new_cell_idx][0]._control_index = 0
+                        _apply_current_highlight()
+                        return
+                    new_cell_idx += 1
+
+        def on_row_activate():
+            """Activate current control"""
+            core._ensure_visible_cell(row)
+            cell_ev, controls = row._cells[row._cell_index]
+            if controls and core._is_widget_shown(cell_ev):
+                ctrl_idx = getattr(cell_ev, "_control_index", 0)
+                ctrl_idx = max(0, min(len(controls) - 1, ctrl_idx))
+                _activate_widget(controls[ctrl_idx])
+
+        def on_row_focus_in(_w, *_args):
+            _clear_all_highlights()
+            core._ensure_visible_cell(row)
+            _apply_current_highlight()
+
+        def on_row_focus_out(_w, *_args):
+            _clear_all_highlights()
+
+        row._on_left = on_row_left
+        row._on_right = on_row_right
+        row._on_activate = on_row_activate
+        row.connect("focus-in-event", on_row_focus_in)
+        row.connect("focus-out-event", on_row_focus_out)
+
+        core.register_row(row)
+    else:
+        # Headers or rows without controls are not selectable
+        row._on_left = None
+        row._on_right = None
+        row._on_activate = None
+
+    return row
+
+
+def _build_feature_row(core: UICore, feat) -> Gtk.EventBox:
+    row = Gtk.EventBox()
+    row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    row_box.get_style_context().add_class("feature-row")
+    row.add(row_box)
+    row.set_above_child(False)
+    first_refresher = len(core.refreshers)
+    row._refreshers = []
+
+    def refresh_row():
+        for task in row._refreshers:
+            if hasattr(task, "refresh_now"):
+                task.refresh_now()
+
+    display_label = (feat.attrs.get("display", "") or feat.attrs.get("name", "") or "").strip()
+
+    # Check if feature contains tabs
+    has_tabs = any(child.kind == "tab" for child in feat.children)
+
+    # Only add label and spacer if feature has a display label
+    if display_label:
+        name_lbl = Gtk.Label(label=_(display_label))
+        name_lbl.set_xalign(0.0)
+        name_lbl.get_style_context().add_class("item-text")
+        name_lbl.set_width_chars(15)  # Fixed width for label
+        row_box.pack_start(name_lbl, False, False, 0)
+
+        # Add spacer only for tabs to push them to the right
+        if has_tabs:
+            spacer = Gtk.Box()
+            spacer.set_hexpand(True)
+            row_box.pack_start(spacer, True, True, 0)
+
+    # Build children strictly in XML order, center value between buttons
+    row._items = []
+    row._item_index = 0
+    if_condition = (feat.attrs.get("if", "") or "").strip()
+    if if_condition:
+        # Track this widget for dynamic visibility updates
+        core._conditional_widgets.append((row, if_condition))
+        # Initially hide, will be shown after IDs are registered
+        row._cond_visible = False
+        row.set_visible(False)
+
+    # For choice features, add the Select button right after the label
+    choices = [c for c in feat.children if c.kind in ("choice", "choice_cmd")]
+    if choices:
+        # Prewarm dynamic display="${...}" commands for the choices so the
+        # popup opens instantly (cache hit) instead of blocking on a
+        # subprocess the first time. For <choice_cmd>, also prewarm the
+        # action_arg command.
+        _pw_cmds = []
+        for _c in choices:
+            _pw_cmds.extend(extract_commands((_c.attrs.get("display", "") or "").strip()))
+            if _c.kind == "choice_cmd":
+                _pw_cmds.extend(extract_commands((_c.attrs.get("action_arg", "") or "").strip()))
+        if _pw_cmds:
+            warm_shell_cache(_pw_cmds)
+        def open_choice():
+            core._about_to_show_dialog = True
+            _open_choice_popup(core, display_label, expand_choices(choices))
+            core._about_to_show_dialog = False
+
+        choice_btn = Gtk.Button.new_with_label(_("Select"))
+        choice_btn.get_style_context().add_class("cc-button")
+        choice_btn.get_style_context().add_class("cc-choice")
+        choice_btn.set_can_focus(True)
+        choice_btn.set_size_request(70, -1)  # Fixed width like other buttons
+        choice_btn.set_hexpand(False)  # Prevent horizontal expansion
+        choice_btn.set_halign(Gtk.Align.START)  # Align normally, not to the end
+        row_box.pack_start(choice_btn, False, False, 8)
+        choice_btn.connect("clicked", lambda *_: open_choice())
+
+        row._items.append(choice_btn)
+        if not hasattr(row, "_on_activate"):
+            row._on_activate = open_choice
+            
+        # Add touchscreen synchronization
+        core.add_touch_sync_to_widget(choice_btn)
+
+    for sub in feat.children:
+        kind = sub.kind
+
+        if kind == "button":
+            text = (sub.attrs.get("display", "") or "").strip()
+            if not text and not (sub.attrs.get("icon", "") or "").strip():
+                text = "Button"
+            action = sub.attrs.get("action", "")
+            afterclick = sub.attrs.get("afterclick", "")
+            update_ids = xmlattr_to_set(sub.attrs.get("updateids", ""))
+            btn = Gtk.Button.new_with_label(_(text) if text else "")
+            btn.get_style_context().add_class("cc-button")
+            _apply_icon(btn, _(text) if text else "", sub)
+            btn.set_can_focus(True)
+            btn.set_size_request(70, -1)  # Fixed width for buttons
+            row_box.pack_start(btn, False, False, 8)
+            btn.connect("clicked", core.make_action_cb(action, key=f"btn:{text}:{action}", afterclick=afterclick, update_ids=update_ids, on_done=refresh_row))
+            row._items.append(btn)
+            
+            # Add touchscreen synchronization
+            core.add_touch_sync_to_widget(btn)
+
+        elif kind == "button_confirm":
+            text = (sub.attrs.get("display", "") or "Confirm?").strip()
+            action = sub.attrs.get("action", "")
+            afterclick = sub.attrs.get("afterclick", "")
+            update_ids = xmlattr_to_set(sub.attrs.get("update_ids", ""))
+            btn = Gtk.Button.new_with_label(_(text))
+            btn.get_style_context().add_class("cc-button")
+            btn.get_style_context().add_class("cc-button-confirm")
+            _apply_icon(btn, _(text), sub)
+            btn.set_can_focus(True)
+            btn.set_size_request(70, -1)
+            row_box.pack_start(btn, False, False, 8)
+
+            def on_confirm_click(_w):
+                core._about_to_show_dialog = True; _show_confirm_dialog(core, text, action, afterclick, update_ids); core._about_to_show_dialog = False
+
+            btn.connect("clicked", on_confirm_click)
+            row._items.append(btn)
+            
+            # Add touchscreen synchronization
+            core.add_touch_sync_to_widget(btn)
+
+        elif kind == "text":
+            lbl = Gtk.Label(label="")
+            lbl.get_style_context().add_class("value")
+            # Get alignment from attribute (default: center)
+            align_attr = (sub.attrs.get("align", "center") or "center").strip().lower()
+            if align_attr == "left":
+                lbl.set_xalign(0.0)
+                lbl.set_halign(Gtk.Align.START)
+            elif align_attr == "right":
+                lbl.set_xalign(1.0)
+                lbl.set_halign(Gtk.Align.END)
+            else:  # center (default)
+                lbl.set_xalign(0.5)
+                lbl.set_halign(Gtk.Align.CENTER)
+            # For features with choices, don't set fixed width - let text size naturally
+            if not any(c.kind in ("choice", "choice_cmd") for c in feat.children):
+                lbl.set_hexpand(True)
+                lbl.set_line_wrap(True)
+                lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                lbl.set_max_width_chars(40)
+            row_box.pack_start(lbl, False, False, 8)
+            disp = (sub.attrs.get("display", "") or "").strip()
+            refresh = float(sub.attrs.get("refresh", feat.attrs.get("refresh", DEFAULT_REFRESH_SEC)))
+
+            # Handle dynamic visibility for id() and !id() conditions
+            if_condition = (sub.attrs.get("if", "") or "").strip()
+            if if_condition:
+                # Track this widget for dynamic visibility updates
+                core._conditional_widgets.append((lbl, if_condition))
+                # Initially hide, will be shown after IDs are registered
+                lbl._cond_visible = False
+                lbl.set_visible(False)
+
+            # Check if display contains ${...} command substitution
+            if "${" in disp and not is_cmd(disp):
+                # Mixed content or multiple commands - use command substitution
+                def upd_expand(_l=lbl, _disp=disp):
+                    _l.set_text(expand_command_string(_disp))
+
+                core.refreshers.append(ExpandRefreshTask(upd_expand, refresh))
+                element_id = (sub.attrs.get("id", "") or "").strip()
+                if element_id:
+                    core.refreshfunctionsbyids[element_id] = {"function": upd_expand}
+                initial_val = expand_command_string(disp)
+                lbl.set_text(initial_val)
+                # Register ID if content is non-empty
+                if initial_val.strip():
+                    register_element_id(sub, core.rendered_ids)
+            elif is_cmd(disp):
+                c = cmd_of(disp)
+                def upd(val: str, _l=lbl, _sub=sub, _core=core):
+                    _l.set_text(val)
+                    # Register/unregister ID based on content
+                    if val.strip():
+                        register_element_id(_sub, _core.rendered_ids)
+                    else:
+                        elem_id = _sub.attrs.get("id", "").strip()
+                        if elem_id and elem_id in _core.rendered_ids:
+                            _core.rendered_ids.remove(elem_id)
+                core.refreshers.append(RefreshTask(upd, c, refresh))
+                element_id = (sub.attrs.get("id", "") or "").strip()
+                if element_id:
+                    core.refreshfunctionsbyids[element_id] = {"function": upd}
+            else:
+                lbl.set_text(disp)
+                # Register ID for static text if non-empty
+                if disp.strip():
+                    register_element_id(sub, core.rendered_ids)
+
+        elif kind == "img":
+            core.build_img(feat, sub, row_box, pack_end=False)
+
+        elif kind == "qrcode":
+            core.build_qrcode(feat, sub, row_box, pack_end=False)
+
+        elif kind == "progressbar":
+            bar = core.build_progressbar(feat, sub, row_box, pack_end=False)
+            if bar:
+                bar.set_halign(Gtk.Align.FILL)
+                row_box.child_set_property(bar, "expand", True)
+                row_box.child_set_property(bar, "fill", True)
+
+        elif kind == "doc":
+            btn = core.build_doc(feat, sub, row_box, pack_end=False)
+            if btn:
+                row._items.append(btn)
+
+        elif kind == "hgroup":
+            # Nested hgroup in feature - create horizontal layout
+            nested_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+            row_box.pack_start(nested_box, False, False, 8)
+            for hg_child in sub.children:
+                if hg_child.kind == "text":
+                    core.build_text(feat, hg_child, nested_box, align_end=False)
+                elif hg_child.kind == "button":
+                    btn = core.build_button(feat, hg_child, nested_box, pack_end=False)
+                    row._items.append(btn)
+                elif hg_child.kind == "tab":
+                    tab = core.build_tab(feat, hg_child, nested_box, pack_end=False)
+                    row._items.append(tab)
+                elif hg_child.kind == "button_confirm":
+                    text = (hg_child.attrs.get("display", "") or "Confirm?").strip()
+                    action = hg_child.attrs.get("action", "")
+                    btn = Gtk.Button.new_with_label(_(text))
+                    btn.get_style_context().add_class("cc-button")
+                    btn.get_style_context().add_class("cc-button-confirm")
+                    _apply_icon(btn, _(text), hg_child)
+                    btn.set_can_focus(True)
+                    btn.set_size_request(70, -1)
+                    nested_box.pack_start(btn, False, False, 3)
+                    def on_confirm_click(_w, _core=core, _text=text, _action=action):
+                        _afterclick = hg_child.attrs.get("afterclick", "")
+                        _update_ids = xmlattr_to_set(hg_child.attrs.get("update_ids", ""))
+                        _core._about_to_show_dialog = True; _show_confirm_dialog(_core, _text, _action, _afterclick, _update_ids); _core._about_to_show_dialog = False
+                    btn.connect("clicked", on_confirm_click)
+                    row._items.append(btn)
+
+        elif kind == "toggle":
+            tog = core.build_toggle(feat, sub, row_box, pack_end=False)
+            row._items.append(tog)
+
+        elif kind == "switch":
+            switch = core.build_switch(feat, sub, row_box, pack_end=False)
+            row._items.append(switch)
+
+        elif kind == "tab":
+            tab = core.build_tab(feat, sub, row_box, pack_end=False)
+            if tab:
+                row._items.append(tab)
+
+    # Only register row if it has interactive items
+    if row._items:
+        # Check if this row contains tabs - if so, set up tab switching
+        tabs = [item for item in row._items if hasattr(item, '_tab_target')]
+        if tabs:
+            # This is a tab row - set up content switching
+            row._tabs = tabs
+            row._tab_contents = {}  # Will be populated later when hgroups are processed
+            row._core = core  # Store core reference for focus management
+
+            def make_switch_handler(target_tab):
+                """Create a switch handler for a specific tab"""
+                def switch_to_tab(btn):
+                    # Prevent recursive tab switching
+                    core = row._core
+                    if hasattr(core, '_tab_switching_in_progress') and core._tab_switching_in_progress:
+                        return
+                    
+                    core._tab_switching_in_progress = True
+                    
+                    try:
+                        # Ensure this tab is active and uncheck all others
+                        btn.set_active(True)
+                        
+                        # Update the _item_index to point to this tab
+                        if hasattr(row, '_items') and target_tab in row._items:
+                            tab_index = row._items.index(target_tab)
+                            row._item_index = tab_index
+                        
+                        # Uncheck all other tabs (block signals to prevent recursion)
+                        for t in row._tabs:
+                            if t != target_tab:
+                                t.handler_block_by_func(t._switch_handler)
+                                t.set_active(False)
+                                t.handler_unblock_by_func(t._switch_handler)
+
+                        # Show/hide content based on target
+                        target = getattr(target_tab, '_tab_target', '')
+                        if target and hasattr(row, '_tab_contents') and hasattr(row, '_content_box'):
+                            content_box = row._content_box
+                            core = row._core  # Get core reference
+
+                            # Collect all tab content rows to remove from focus list
+                            all_tab_rows = []
+                            for content_id, content_widget in row._tab_contents.items():
+                                if hasattr(content_widget, '_tab_rows'):
+                                    all_tab_rows.extend(content_widget._tab_rows)
+
+                            # Remove all tab content rows from focus_rows
+                            for r in all_tab_rows:
+                                if r in core.focus_rows:
+                                    core.unhighlight_row(r)
+                                    core.focus_rows.remove(r)
+                            # Remove all tab content frames
+                            for content_id, content_widget in row._tab_contents.items():
+                                if hasattr(content_widget, '_frame'):
+                                    frame = content_widget._frame
+                                    if frame.get_parent():
+                                        frame.get_parent().remove(frame)
+                            # Add back and show the selected content
+                            if target in row._tab_contents:
+                                content_widget = row._tab_contents[target]
+                                if hasattr(content_widget, '_frame'):
+                                    # Insert frame into content_box
+                                    content_box.pack_start(content_widget._frame, False, False, 0)
+                                    content_widget._frame.show_all()
+                                    # keep rows hidden by an `if` hidden (no flash on tab switch)
+                                    core._reapply_conditional_visibility()
+                                # Add this tab's rows back to focus_rows with small delay to ensure realization
+                                if hasattr(content_widget, '_tab_rows'):
+                                    def delayed_add_tab_rows():
+                                        for r in content_widget._tab_rows:
+                                            if r not in core.focus_rows:
+                                                core.focus_rows.append(r)
+                                        return False
+                                    GLib.timeout_add(10, delayed_add_tab_rows)
+                            else:
+                                pass
+                            # Reset focus index if needed
+                            if core.focus_index >= len(core.focus_rows):
+                                core.focus_index = max(0, len(core.focus_rows) - 1)
+                            
+                            # Auto-scroll to show the focused element in the new tab content
+                            def delayed_tab_scroll():
+                                # First scroll to top of the new tab content
+                                if hasattr(core, '_scrolled_window'):
+                                    vadjustment = core._scrolled_window.get_vadjustment()
+                                    vadjustment.set_value(0)
+                                # Then scroll to focused element
+                                core.scroll_to_focused_widget()
+                                return False
+                            GLib.timeout_add(50, delayed_tab_scroll)
+                        
+                        
+                    finally:
+                        # Always clear the flag, even if an exception occurs
+                        core._tab_switching_in_progress = False
+
+                return switch_to_tab
+            # Connect tab buttons to switch content
+            for tab in tabs:
+                handler = make_switch_handler(tab)
+                tab._switch_handler = handler
+                tab.connect("toggled", handler)
+                
+                # Add touchscreen synchronization
+                core.add_touch_sync_to_widget(tab)
+            # Don't activate first tab yet - will be done after content is linked
+
+        # Left/Right selection within row
+        def _set_item_focus(idx: int):
+            if not row._items:
+                return
+            row._item_index = max(0, min(len(row._items) - 1, idx))
+            item = row._items[row._item_index]
+            _focus_widget(item)
+            # For tab rows, also activate the tab to switch content
+            if hasattr(item, '_tab_target') and hasattr(row, '_tabs'):
+                item.set_active(True)
+
+        def on_left():
+            current_idx = getattr(row, '_item_index', 0)
+            new_idx = current_idx - 1
+            if new_idx >= 0:
+                _set_item_focus(new_idx)
+
+        def on_right():
+            current_idx = getattr(row, '_item_index', 0)
+            new_idx = current_idx + 1
+            if new_idx < len(row._items):
+                _set_item_focus(new_idx)
+
+        def on_activate():
+            if not row._items:
+                return
+            item = row._items[row._item_index]
+            # For tabs, toggle them to trigger content switching
+            if hasattr(item, '_tab_target'):
+                item.set_active(True)
+            else:
+                _activate_widget(item)
+
+        row._on_left = on_left
+        row._on_right = on_right
+        if not hasattr(row, "_on_activate"):
+            row._on_activate = on_activate
+
+        core.register_row(row)
+    else:
+        # Row without interactive items is not selectable
+        row._on_left = None
+        row._on_right = None
+        row._on_activate = None
+
+    row._refreshers = core.refreshers[first_refresher:]
+
+    if any(c.kind == "progressbar" for c in feat.children):
+        for w in row_box.get_children():
+            if isinstance(w, Gtk.Button):
+                core._bar_buttons.add_widget(w)
+
+    # Register feature ID if it has one and was successfully built
+    register_element_id(feat, core.rendered_ids, core)
+
+    return row
+
+def _hide_dialog_action_area(dialog):
+    """Completely hide and remove the dialog action area"""
+    action_area = dialog.get_action_area()
+    if action_area:
+        # Remove all children first
+        for child in action_area.get_children():
+            action_area.remove(child)
+        # Hide it completely
+        action_area.set_visible(False)
+        action_area.set_size_request(-1, 0)
+        action_area.set_no_show_all(True)
+        # Try to remove it from parent entirely
+        parent = action_area.get_parent()
+        if parent:
+            try:
+                parent.remove(action_area)
+            except:
+                pass
+    # Also make content area fill the entire dialog
+    content = dialog.get_content_area()
+    if content:
+        content.set_vexpand(True)
+        content.set_hexpand(True)
+
+def _show_confirm_dialog(core: UICore, message: str, action: str, afterclick: str = "", update_ids: set[str] = set()):
+    """Show a confirmation dialog before executing an action"""
+    core._dialog_open = True  # Prevent main window from closing
+    core._suspend_inactivity_timer = True  # Suspend timer for confirm dialog
+
+    # Use Gtk.Window instead of Gtk.Dialog to avoid action area issues
+    dialog = Gtk.Window()
+
+    if core._is_wayland:
+        GtkLayerShell.init_for_window(dialog)
+        GtkLayerShell.set_layer(dialog, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_interactivity(dialog, False)
+        # screen: follow the BCC window's screen
+        monitor = core.monitor_for_popup()
+        if monitor is not None:
+            GtkLayerShell.set_monitor(dialog, monitor)
+
+    # Track this dialog so it can be destroyed on timeout
+    core._current_dialog = dialog
+    dialog.set_transient_for(core.window)
+    dialog.set_modal(True)
+    dialog.set_decorated(False)
+
+    if core._scale_class == "small":
+        dialog.set_default_size(240, 120)
+    elif core._scale_class in ("large", "xlarge"):
+        dialog.set_default_size(540, 300)
+    else:
+        dialog.set_default_size(400, 200)
+
+    dialog.set_resizable(False)
+    dialog.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+    dialog.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+
+    # Close dialog if main window is destroyed
+    def on_parent_destroy(*_):
+        try:
+            dialog.destroy()
+        except:
+            pass
+    core.window.connect("destroy", on_parent_destroy)
+
+    # Close everything if dialog loses focus to external app
+    def on_dialog_focus_out(*_):
+        def check_and_close():
+            if not dialog.is_active():
+                core.quit()
+            return False
+        GLib.timeout_add(100, check_and_close)
+        return False
+    dialog.connect("focus-out-event", on_dialog_focus_out)
+
+    # Style the dialog window itself
+    dialog.get_style_context().add_class("popup-root")
+    dialog.get_style_context().add_class(f"scale-{core._scale_class}")
+    dialog.get_style_context().add_class("confirm-dialog")
+
+    # Add frame for inner content (no action area with Gtk.Window!)
+    frame = Gtk.Frame()
+    frame.set_shadow_type(Gtk.ShadowType.NONE)
+    dialog.add(frame)
+
+    inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    if core._scale_class == "small":
+        inner.set_border_width(8)
+    elif core._scale_class in ("large", "xlarge"):
+        inner.set_border_width(30)
+    else:
+        inner.set_border_width(20)
+    frame.add(inner)
+
+    label = Gtk.Label(label=_(message))
+    label.set_xalign(0.5)
+    label.set_line_wrap(True)
+    label.get_style_context().add_class("item-text")
+    inner.pack_start(label, True, True, 15)
+
+    # Button box
+    button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+    button_box.set_halign(Gtk.Align.CENTER)
+    inner.pack_start(button_box, False, False, 10)
+
+    buttons = []
+    current_btn = [0]  # 0 = Cancel (default), 1 = Confirm
+
+    cancel_btn = Gtk.Button.new_with_label(_("Cancel"))
+    cancel_btn.get_style_context().add_class("cc-button")
+    if core._scale_class == "small":
+        cancel_btn.set_size_request(80, -1)
+    elif core._scale_class in ("large", "xlarge"):
+        cancel_btn.set_size_request(120, -1)
+    else:
+        cancel_btn.set_size_request(100, -1)
+    cancel_btn.set_can_focus(True)
+    # Explicitly prevent GTK from giving this button default focus
+    cancel_btn.set_receives_default(False)
+    button_box.pack_start(cancel_btn, False, False, 0)
+    cancel_btn.connect("clicked", lambda _: dialog.destroy())
+    buttons.append(cancel_btn)
+
+    confirm_btn = Gtk.Button.new_with_label(_("Confirm"))
+    confirm_btn.get_style_context().add_class("cc-button")
+    if core._scale_class == "small":
+        confirm_btn.set_size_request(80, -1)
+    elif core._scale_class in ("large", "xlarge"):
+        confirm_btn.set_size_request(120, -1)
+    else:
+        confirm_btn.set_size_request(100, -1)
+    confirm_btn.set_can_focus(True)
+    # Explicitly prevent GTK from giving this button default focus
+    confirm_btn.set_receives_default(False)
+    button_box.pack_start(confirm_btn, False, False, 0)
+    buttons.append(confirm_btn)
+
+    def update_button_focus():
+        # Clear focus from ALL widgets in the main UI first
+        try:
+            for row in core.focus_rows:
+                if hasattr(row, "_items") and row._items:
+                    for item in row._items:
+                        try:
+                            ctx = item.get_style_context()
+                            ctx.remove_class("focused-cell")
+                            ctx.remove_class("choice-selected")
+                        except:
+                            pass
+                if hasattr(row, "_cells") and row._cells:
+                    for cell_ev, controls in row._cells:
+                        try:
+                            cell_ev.get_style_context().remove_class("focused-cell")
+                            for ctrl in controls:
+                                ctx = ctrl.get_style_context()
+                                ctx.remove_class("focused-cell")
+                                ctx.remove_class("choice-selected")
+                        except:
+                            pass
+        except:
+            pass
+        
+        # Clear focus from all dialog buttons
+        for i, btn in enumerate(buttons):
+            try:
+                ctx = btn.get_style_context()
+                classes_before = list(ctx.list_classes())
+                ctx.remove_class("focused-cell")
+                ctx.remove_class("choice-selected")
+                classes_after = list(ctx.list_classes())
+            except Exception as e:
+                pass
+        
+        # Apply focus to the current button
+        if 0 <= current_btn[0] < len(buttons):
+            try:
+                current_button = buttons[current_btn[0]]
+                ctx = current_button.get_style_context()
+                classes_before = list(ctx.list_classes())
+                ctx.add_class("focused-cell")
+                ctx.add_class("choice-selected")
+                classes_after = list(ctx.list_classes())
+            except Exception as e:
+                pass
+
+    def on_confirm(_w):
+        dialog.destroy()
+        if action:
+            def run_confirm_action():
+                run_shell_capture(action, get_output = False)
+                # Run afterclick if specified
+                if afterclick:
+                    handle_afterclick_after(core, afterclick)
+                if update_ids:
+                    handle_update_ids(core, update_ids)
+            if afterclick:
+                handle_afterclick_before(core, afterclick)
+            run_off_main_thread(run_confirm_action)
+
+    # Override gamepad handler for dialog
+    original_handler = core._handle_gamepad_action_main
+
+    def dialog_gamepad_handler(action_key: str):
+        core.reset_inactivity_timer()  # Reset timer on dialog interaction
+        if action_key == "activate":
+            if current_btn[0] == 1:
+                on_confirm(None)
+            else:
+                dialog.destroy()
+        elif action_key == "back":
+            dialog.destroy()
+        elif action_key in ("axis_left", "axis_right", "pan_left", "pan_right"):
+            old_btn = current_btn[0]
+            current_btn[0] = 1 - current_btn[0]  # Toggle between 0 and 1
+            update_button_focus()
+        return False
+
+    core._handle_gamepad_action = dialog_gamepad_handler
+
+    def on_key_press(_w, ev: Gdk.EventKey):
+        core.reset_inactivity_timer()  # Reset timer on keyboard interaction
+        key = Gdk.keyval_name(ev.keyval) or ""
+        if key.lower() == "escape":
+            dialog.destroy()
+            return True
+        elif key in ("Left", "KP_Left"):
+            current_btn[0] = 0
+            update_button_focus()
+            return True
+        elif key in ("Right", "KP_Right"):
+            current_btn[0] = 1
+            update_button_focus()
+            return True
+        elif key in ("Return", "KP_Enter", "space"):
+            if current_btn[0] == 1:
+                on_confirm(None)
+            else:
+                dialog.destroy()
+            return True
+        return False
+
+    def on_button_click(_w):
+        core.reset_inactivity_timer()  # Reset timer on button click
+
+    cancel_btn.connect("clicked", lambda _: (on_button_click(_), dialog.destroy()))
+    confirm_btn.connect("clicked", lambda _: (on_button_click(_), on_confirm(_)))
+    dialog.connect("key-press-event", on_key_press)
+
+    dialog.show_all()
+    current_btn[0] = 0  # Default to Cancel
+    
+    # Ensure no GTK focus is set initially
+    dialog.set_focus(None)
+    
+    GLib.idle_add(update_button_focus)
+
+    # Connect destroy handler to clean up
+    def on_dialog_destroy(*_):
+        # Clear the dialog reference
+        if hasattr(core, '_current_dialog') and core._current_dialog == dialog:
+            core._current_dialog = None
+        # Restore original handler
+        core._handle_gamepad_action = original_handler
+        core._dialog_open = False  # Allow main window to close again
+        core._suspend_inactivity_timer = False  # Resume timer
+        # Resume inactivity timer
+        core.reset_inactivity_timer()
+    dialog.connect("destroy", on_dialog_destroy)
+    dialog.show_all()
+
+def _open_choice_popup(core: UICore, feature_label: str, choices):
+    """Open a popup dialog to select from available choices"""
+    core._dialog_open = True  # Prevent main window from closing on focus loss
+    core._dialog_allows_timeout = True  # Allow inactivity timer to close window
+    # Use Gtk.Window instead of Gtk.Dialog to avoid action area issues
+    dialog = Gtk.Window()
+
+    if core._is_wayland:
+        GtkLayerShell.init_for_window(dialog)
+        GtkLayerShell.set_layer(dialog, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_interactivity(dialog, False)
+        # screen: follow the BCC window's screen
+        monitor = core.monitor_for_popup()
+        if monitor is not None:
+            GtkLayerShell.set_monitor(dialog, monitor)
+
+    # Track this dialog so it can be destroyed on timeout
+    core._current_dialog = dialog
+    dialog.set_transient_for(core.window)
+    dialog.set_modal(True)
+    if core._scale_class == "small":
+        dialog.set_default_size(400, 300)
+    elif core._scale_class in ("large", "xlarge"):
+        dialog.set_default_size(800, 300)
+    else:
+        dialog.set_default_size(600, 500)
+    dialog.set_decorated(False)
+    dialog.set_resizable(False)
+    dialog.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+    dialog.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+
+    # Close dialog if main window is destroyed
+    def on_parent_destroy(*_):
+        try:
+            dialog.destroy()
+        except:
+            pass
+    core.window.connect("destroy", on_parent_destroy)
+
+    # Close everything if dialog loses focus to external app
+    def on_dialog_focus_out(*_):
+        def check_and_close():
+            if not dialog.is_active():
+                core.quit()
+            return False
+        GLib.timeout_add(100, check_and_close)
+        return False
+    dialog.connect("focus-out-event", on_dialog_focus_out)
+
+    # Style the dialog window itself
+    dialog.get_style_context().add_class("popup-root")
+    dialog.get_style_context().add_class(f"scale-{core._scale_class}")
+    dialog.get_style_context().add_class("confirm-dialog")
+
+    # Add frame for inner content (no action area with Gtk.Window!)
+    frame = Gtk.Frame()
+    frame.set_shadow_type(Gtk.ShadowType.NONE)
+    dialog.add(frame)
+
+    inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    if core._scale_class == "small":
+        inner.set_border_width(10)
+    elif core._scale_class in ("large", "xlarge"):
+        inner.set_border_width(30)
+    else:
+        inner.set_border_width(20)
+    frame.add(inner)
+
+    label = Gtk.Label(label=_(feature_label) + ":")
+    label.set_xalign(0.5)  # Center the label
+    label.get_style_context().add_class("group-title")
+    inner.pack_start(label, False, False, 15)
+
+    # Create a scrolled window for the choices
+    scrolled = Gtk.ScrolledWindow()
+    scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    scrolled.set_min_content_height(250)
+    inner.pack_start(scrolled, True, True, 0)
+
+    # Box to hold choice buttons
+    choice_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    choice_box.set_border_width(6)
+    scrolled.add(choice_box)
+
+    choice_buttons = []
+    current_choice = [0]  # Always start with first choice
+
+    def on_choice_selected(action: str, afterclick_attr: str = "", update_ids_attr: str = ""):
+        import threading
+        dialog.destroy()
+        if action:
+            def run_choice_action():
+                run_shell_capture(action, get_output = False)
+                # Run afterclick if specified
+                if afterclick_attr:
+                    handle_afterclick_after(core, afterclick_attr)
+                if update_ids_attr:
+                    handle_afterclick_after(core, update_ids_attr)
+            if afterclick_attr:
+                handle_afterclick_before(core, afterclick_attr)
+            run_off_main_thread(run_choice_action)
+
+    def update_choice_focus():
+        # Clear focus from all choice buttons
+        for btn in choice_buttons:
+            try:
+                ctx = btn.get_style_context()
+                ctx.remove_class("focused-cell")
+                ctx.remove_class("choice-selected")
+            except:
+                pass
+            
+        # Apply focus to selected button
+        if 0 <= current_choice[0] < len(choice_buttons):
+            try:
+                selected_btn = choice_buttons[current_choice[0]]
+                ctx = selected_btn.get_style_context()
+                ctx.add_class("focused-cell")
+                ctx.add_class("choice-selected")
+            except:
+                pass
+
+    # Override core's gamepad handler temporarily for dialog navigation
+    original_handler = core._handle_gamepad_action
+
+    def dialog_gamepad_handler(action: str):
+        core.reset_inactivity_timer()  # Reset timer on dialog interaction
+        if action == "activate":
+            if choice_buttons:
+                choice_buttons[current_choice[0]].emit("clicked")
+        elif action == "back":
+            dialog.destroy()
+        elif action in ("axis_up", "pan_up"):
+            current_choice[0] = max(0, current_choice[0] - 1)
+            update_choice_focus()
+        elif action in ("axis_down", "pan_down"):
+            current_choice[0] = min(len(choice_buttons) - 1, current_choice[0] + 1)
+            update_choice_focus()
+        return False
+
+    core._handle_gamepad_action = dialog_gamepad_handler
+
+    # Per-choice dynamic display: display="${cmd}" (optionally with cache="N").
+    # Resolve each label through the shared TTL cache so the popup never blocks
+    # the UI thread in steady state. A cold cache yields "" here and a
+    # background refresh (already prewarmed at build time) warms it for the
+    # next open; a one-shot post-show pass re-reads the labels once more.
+    def _resolve_choice_display(choice, allow_block: bool) -> str:
+        disp = (choice.attrs.get("display", "") or "Option").strip()
+        if not disp:
+            disp = "Option"
+        if "${" in disp:
+            ttl = _choice_cache_ttl(choice)
+            return expand_command_string_cached(disp, ttl_sec=ttl, allow_block=allow_block) or "Option"
+        return disp
+
+    # Create a button for each choice
+    for choice in choices:
+        display = _resolve_choice_display(choice, allow_block=shell_cache_has_all(
+            extract_commands((choice.attrs.get("display", "") or "").strip()),
+            _choice_cache_ttl(choice)))
+
+        action = choice.attrs.get("action", "")
+        afterclick = choice.attrs.get("afterclick", "")
+        update_ids = xmlattr_to_set(choice.attrs.get("update_ids", ""))
+
+        btn = Gtk.Button.new_with_label(_(display))
+        btn.set_can_focus(True)
+        btn.get_style_context().add_class("choice-option")
+        choice_box.pack_start(btn, False, False, 0)
+
+        def on_choice_click(_w, a=action, ac=afterclick, ui=update_ids):
+            core.reset_inactivity_timer()  # Reset timer on button click
+            on_choice_selected(a, ac, ui)
+
+        btn.connect("clicked", on_choice_click)
+        choice_buttons.append(btn)
+
+    # Add keyboard navigation
+    def on_key_press(_w, ev: Gdk.EventKey):
+        core.reset_inactivity_timer()  # Reset timer on keyboard interaction
+        key = Gdk.keyval_name(ev.keyval) or ""
+        if key.lower() == "escape":
+            dialog.destroy()
+            return True
+        elif key in ("Up", "KP_Up"):
+            current_choice[0] = max(0, current_choice[0] - 1)
+            update_choice_focus()
+            return True
+        elif key in ("Down", "KP_Down"):
+            current_choice[0] = min(len(choice_buttons) - 1, current_choice[0] + 1)
+            update_choice_focus()
+            return True
+        elif key in ("Return", "KP_Enter", "space"):
+            if choice_buttons:
+                choice_buttons[current_choice[0]].emit("clicked")
+            return True
+        return False
+
+    dialog.connect("key-press-event", on_key_press)
+
+    dialog.show_all()
+
+    # Apply initial focus after dialog is shown - always start with first choice
+    if choice_buttons:
+        current_choice[0] = 0  # Explicitly reset to first choice
+        GLib.idle_add(update_choice_focus)
+
+    # One-shot refresh of dynamic choice labels after the popup is shown.
+    # Each label is re-resolved off the UI thread (respecting its cache TTL);
+    # only labels that actually changed are pushed back to their buttons. The
+    # dialog may have been closed by the time the results arrive, so every GTK
+    # access is guarded.
+    _dyn_choices = [(c, b) for c, b in zip(choices, choice_buttons)
+                   if "${" in (c.attrs.get("display", "") or "")]
+    if _dyn_choices:
+        def _refresh_labels():
+            for choice, btn in _dyn_choices:
+                try:
+                    new_disp = _resolve_choice_display(choice, allow_block=False)
+                    if not new_disp:
+                        new_disp = "Option"
+                    def _apply(_b=btn, _nd=new_disp):
+                        try:
+                            if _b.get_label() != _nd:
+                                _b.set_label(_(_nd))
+                        except Exception:
+                            pass
+                        return False
+                    GLib.idle_add(_apply)
+                except Exception:
+                    pass
+        run_off_main_thread(_refresh_labels)
+
+    # Connect destroy handler to clean up
+    def on_dialog_destroy(*_):
+        # Clear the dialog reference
+        if hasattr(core, '_current_dialog') and core._current_dialog == dialog:
+            core._current_dialog = None
+        # Restore original handler
+        core._handle_gamepad_action = original_handler
+        core._dialog_open = False  # Allow main window to close again
+        core._dialog_allows_timeout = False  # Reset flag
+        # Resume inactivity timer
+        core.reset_inactivity_timer()
+    dialog.connect("destroy", on_dialog_destroy)
+    dialog.show_all()
+
+# ---- Application wrapper ----
+class ControlCenterApp:
+    def __init__(self, xml_root, css_path: str, auto_close_seconds: int = 0, hidden_at_startup = False, 
+                 fullscreen: bool = False, window_size: tuple[int, int] | None = None,
+                 screen: str | None = None):
+        self.core = UICore(css_path, fullscreen, window_size, screen)
+        self.auto_close_seconds = auto_close_seconds
+        self.core._inactivity_timeout_seconds = auto_close_seconds
+        self.hidden_at_startup = hidden_at_startup
+        self.window = ui_build_containers(self.core, xml_root)
+        if hidden_at_startup:
+            self.window.hide()
+        else:
+            self.window.present()
+
+    def run(self):
+        if not self.hidden_at_startup:
+            self.core.show()
+
+        # At boot the compositor may not be done configuring outputs when the
+        # window was built; keep re-checking the screen selection for a while.
+        self.core._schedule_screen_stabilization()
+
+        # Set up inactivity timer if specified (resets on user interaction)
+        if self.auto_close_seconds > 0:
+            self.core.reset_inactivity_timer()
+
+        Gtk.main()

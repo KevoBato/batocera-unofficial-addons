@@ -1,0 +1,54 @@
+#!/bin/bash
+# Batocera service for the Modern Control Center add-on (BUA).
+#
+# Batocera's Control Center (Hotkey+A) lives in /usr/share/batocera/
+# controlcenter, which is read-only. The add-on's modernised copy is
+# bind-mounted over it, so Batocera's own launcher, hotkey and settings run
+# it unchanged. Nothing on the system is modified: stopping the service
+# (or uninstalling) brings Batocera's Control Center back.
+
+app=/userdata/system/add-ons/bcc-custom/controlcenter
+target=/usr/share/batocera/controlcenter
+pidfile=/var/run/batocera-controlcenter.pid
+
+is_bound() { awk -v m="$target" '$2==m {f=1} END {exit !f}' /proc/mounts; }
+
+# Batocera keeps the Control Center running hidden in the background and
+# only reads its code at start-up: restart it so the change shows now.
+restart_bcc() {
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null)
+    [ -n "$pid" ] && [ -e "/proc/$pid" ] || return 0
+    kill "$pid" 2>/dev/null
+    sleep 1
+    rm -f "$pidfile"
+    setsid batocera-controlcenter hidden </dev/null >/dev/null 2>&1 &
+}
+
+case "$1" in
+    start)
+        [ -d "$target" ] || exit 0  # no Control Center on this Batocera (before v43)
+        [ -f "$app/controlcenter.py" ] || { echo "bcc-custom: $app is missing"; exit 1; }
+        if ! is_bound; then
+            # Files Batocera ships with its Control Center that the add-on
+            # does not (icons and pictures its menu uses): use Batocera's
+            cp -an "$target"/. "$app"/ 2>/dev/null
+            rm -rf "$app/__pycache__"
+            mount --bind "$app" "$target"
+            restart_bcc
+        fi
+        ;;
+    stop)
+        if is_bound; then
+            while is_bound; do umount "$target" || umount -l "$target" || break; done
+            restart_bcc
+        fi
+        ;;
+    status)
+        is_bound && echo "bcc-custom: Modern Control Center on" || echo "bcc-custom: Batocera's Control Center"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status}"
+        exit 1
+        ;;
+esac
