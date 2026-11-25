@@ -11,14 +11,33 @@
  * (BCC loads that file instead of its default; delete it to go back.)
  */
 
-/* Accent colors. The Control Center swaps these three for the color picked
-   in System > Theme color (controlcenter.color in batocera.conf), so use
-   them, not literal blues, for anything that should follow the theme color:
-   bcc_accent (main), bcc_accent2 (second color of gradients), bcc_accent_light
-   (text, outlines and glows on the dark panel). */
+/* Theme colors. The Control Center swaps the accent colors for the one
+   picked in System > Theme color (controlcenter.color in batocera.conf), so
+   use these, not literal colors, for anything that should follow it:
+   bcc_accent (main), bcc_accent2 (second color of gradients),
+   bcc_accent_light (text, outlines and glows on the dark panel) and
+   bcc_on_accent (text drawn on the accent color). */
 @define-color bcc_accent #2f7bff;
 @define-color bcc_accent2 #00c2ff;
 @define-color bcc_accent_light #7cc4ff;
+@define-color bcc_on_accent #ffffff;
+
+/* Backgrounds: the dark colors below, each blended with a little bcc_tint.
+   bcc_tint is a neutral dark here, which leaves them as they are; with
+   System > Background > Tinted (controlcenter.background=tinted) the
+   Control Center sets it to the theme color. */
+@define-color bcc_tint #10141c;
+@define-color bcc_bg mix(#0b0e14, @bcc_tint, 0.10);
+@define-color bcc_bg_top mix(#141a26, @bcc_tint, 0.14);
+@define-color bcc_bg_bottom mix(#090b10, @bcc_tint, 0.08);
+@define-color bcc_card mix(#161b26, @bcc_tint, 0.12);
+@define-color bcc_dialog mix(#121620, @bcc_tint, 0.12);
+@define-color bcc_dialog_top mix(#1a2130, @bcc_tint, 0.14);
+@define-color bcc_dialog_bottom mix(#11151e, @bcc_tint, 0.10);
+@define-color bcc_switch_off mix(#2a3040, @bcc_tint, 0.12);
+@define-color bcc_panel mix(#0d111a, @bcc_tint, 0.14);
+@define-color bcc_panel_top mix(#1a2130, @bcc_tint, 0.18);
+@define-color bcc_panel_bottom mix(#0b0e14, @bcc_tint, 0.10);
 
 /* ---------- Palette ----------------------------------------------------
  * bg      #0b0e14 .. #121620   window
@@ -46,8 +65,8 @@
 
 /* ---------- Window ---------- */
 .popup-root {
-  background-color: #0b0e14;
-  background-image: linear-gradient(165deg, #141a26 0%, #0b0e14 55%, #090b10 100%);
+  background-color: @bcc_bg;
+  background-image: linear-gradient(165deg, @bcc_bg_top 0%, @bcc_bg 55%, @bcc_bg_bottom 100%);
   color: #eef1f7;
 }
 
@@ -66,7 +85,7 @@ frame > border {
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 18px;
   padding: 10px 14px;
-  background-color: #161b26;
+  background-color: @bcc_card;
   background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0));
   box-shadow: inset 0 1px rgba(255, 255, 255, 0.05);
 }
@@ -93,7 +112,7 @@ frame > border {
   border-radius: 18px;
   margin: 12px 0;
   padding: 10px;
-  background-color: #161b26;
+  background-color: @bcc_card;
 }
 .scale-small .group-frame, .scale-medium .group-frame {
   border-radius: 10px;
@@ -190,7 +209,7 @@ button.focused-cell {
   background-image: linear-gradient(135deg, @bcc_accent 0%, @bcc_accent2 100%);
   border-color: rgba(255, 255, 255, 0.35);
   box-shadow: 0 0 0 3px alpha(@bcc_accent2, 0.28), 0 6px 18px alpha(@bcc_accent, 0.45);
-  color: #ffffff;
+  color: @bcc_on_accent;
 }
 button.cc-button.choice-selected label,
 button.cc-button.focused-cell label,
@@ -198,7 +217,7 @@ button.cc-button:focus label,
 button.cc-choice.choice-selected label,
 button.choice-option.choice-selected label,
 button.focused-cell label {
-  color: #ffffff;
+  color: @bcc_on_accent;
 }
 
 /* Destructive actions (button_confirm: Quit game, Kill it!) */
@@ -245,8 +264,9 @@ button.cc-toggle {
 button.cc-toggle:checked {
   background-image: linear-gradient(135deg, @bcc_accent 0%, @bcc_accent2 100%);
   border-color: rgba(255, 255, 255, 0.3);
-  color: #ffffff;
+  color: @bcc_on_accent;
 }
+button.cc-toggle:checked label { color: @bcc_on_accent; }
 button.cc-toggle.choice-selected,
 button.cc-toggle.focused-cell,
 button.cc-toggle:focus {
@@ -288,7 +308,7 @@ button.cc-tab.focused-cell {
   border-color: rgba(255, 255, 255, 0.35);
   box-shadow: 0 0 0 3px alpha(@bcc_accent2, 0.28), 0 6px 18px alpha(@bcc_accent, 0.4);
 }
-button.cc-tab.focused-cell label { color: #ffffff; }
+button.cc-tab.focused-cell label { color: @bcc_on_accent; }
 
 /* ---------- Choice popups and confirm dialogs ---------- */
 .choice-selected {
@@ -300,8 +320,8 @@ button.cc-tab.focused-cell label { color: #ffffff; }
 .confirm-dialog {
   border: 1px solid alpha(@bcc_accent_light, 0.35);
   border-radius: 20px;
-  background-color: #121620;
-  background-image: linear-gradient(165deg, #1a2130 0%, #11151e 100%);
+  background-color: @bcc_dialog;
+  background-image: linear-gradient(165deg, @bcc_dialog_top 0%, @bcc_dialog_bottom 100%);
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
 }
 
@@ -324,7 +344,7 @@ dialog .dialog-action-area,
 
 /* ---------- Switches (iOS style) ---------- */
 .cc-switch {
-  background-color: #2a3040;
+  background-color: @bcc_switch_off;
   background-image: none;
   border: 2px solid transparent;  /* constant width: no layout shift */
   border-radius: 999px;
@@ -399,7 +419,7 @@ dialog .dialog-action-area,
 
 /* ---------- Document viewer ---------- */
 .doc-viewer-text {
-  background-color: #0b0e14;
+  background-color: @bcc_bg;
   color: #eef1f7;
   font-family: monospace;
   font-size: 14pt;
@@ -408,7 +428,7 @@ dialog .dialog-action-area,
 .scale-small .doc-viewer-text { font-size: 8pt; padding: 10px; }
 .scale-medium .doc-viewer-text { font-size: 14pt; padding: 15px; }
 .scale-large .doc-viewer-text { font-size: 22px; padding: 30px; }
-.doc-viewer-text text { background-color: #0b0e14; color: #eef1f7; }
+.doc-viewer-text text { background-color: @bcc_bg; color: #eef1f7; }
 
 /* ---------- 4K (extra large) ---------- */
 .scale-xlarge .group-title { padding: 4px 12px 16px 8px; letter-spacing: 3px; }
@@ -448,8 +468,8 @@ dialog .dialog-action-area,
   background-image: none;
 }
 .popup-root.cc-translucent .cc-outer {
-  background-color: rgba(13, 17, 26, 0.86);
-  background-image: linear-gradient(165deg, rgba(26, 33, 48, 0.88) 0%, rgba(11, 14, 20, 0.9) 60%);
+  background-color: alpha(@bcc_panel, 0.86);
+  background-image: linear-gradient(165deg, alpha(@bcc_panel_top, 0.88) 0%, alpha(@bcc_panel_bottom, 0.9) 60%);
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 28px;
 }
@@ -501,7 +521,7 @@ button.cc-toggle.cc-tile:checked {
   background-image: linear-gradient(135deg, @bcc_accent 0%, @bcc_accent2 100%);
   border-color: rgba(255, 255, 255, 0.3);
   box-shadow: 0 10px 28px alpha(@bcc_accent, 0.4);
-  color: #ffffff;
+  color: @bcc_on_accent;
 }
 
 button.cc-toggle.cc-tile.choice-selected,

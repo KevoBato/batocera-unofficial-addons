@@ -139,8 +139,17 @@
                         <choice display="Blue (default)" action="batocera-settings-set controlcenter.color blue" afterclick="bcc_recolor" />
                         <choice display="Orange" action="batocera-settings-set controlcenter.color orange" afterclick="bcc_recolor" />
                         <choice display="Purple" action="batocera-settings-set controlcenter.color purple" afterclick="bcc_recolor" />
-                        <choice display="Green"  action="batocera-settings-set controlcenter.color green" afterclick="bcc_recolor" />
-                        <text display="${case &quot;$(batocera-settings-get controlcenter.color)&quot; in orange) echo Orange;; purple) echo Purple;; green) echo Green;; *) echo Blue;; esac}" refresh="5" />
+                        <choice display="Green" action="batocera-settings-set controlcenter.color green" afterclick="bcc_recolor" />
+                        <choice display="Pink" action="batocera-settings-set controlcenter.color pink" afterclick="bcc_recolor" />
+                        <choice display="Red" action="batocera-settings-set controlcenter.color red" afterclick="bcc_recolor" />
+                        <choice display="Yellow" action="batocera-settings-set controlcenter.color yellow" afterclick="bcc_recolor" />
+                        <text display="${case &quot;$(batocera-settings-get controlcenter.color)&quot; in orange) echo Orange;; purple) echo Purple;; green) echo Green;; pink) echo Pink;; red) echo Red;; yellow) echo Yellow;; *) echo Blue;; esac}" refresh="5" />
+                </feature>
+                <!-- Background: dark, or tinted with the theme color (controlcenter.background) -->
+                <feature name="ThemeBackground" display="Background">
+                        <choice display="Dark (default)" action="batocera-settings-set controlcenter.background dark" afterclick="bcc_recolor" />
+                        <choice display="Tinted with the theme color" action="batocera-settings-set controlcenter.background tinted" afterclick="bcc_recolor" />
+                        <text display="${[ &quot;$(batocera-settings-get controlcenter.background)&quot; = tinted ] &amp;&amp; echo Tinted || echo Dark}" refresh="5" />
                 </feature>
 		<vgroup>
 		  <feature display="Network IP address:">

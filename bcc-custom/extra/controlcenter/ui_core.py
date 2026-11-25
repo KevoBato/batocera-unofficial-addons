@@ -43,24 +43,37 @@ from refresh import RefreshTask, ExpandRefreshTask, DEFAULT_REFRESH_SEC, Debounc
 from shell import run_shell_capture, run_shell_capture_cached, run_shell_capture_set_to_cache, run_shell_capture_lines, run_shell_cache_lookup, normalize_bool_str, get_primary_geometry, expand_command_string, expand_command_string_cached, extract_commands, shell_cache_has_all, warm_shell_cache
 
 # Theme colors for System > Theme color, saved as controlcenter.color in
-# batocera.conf: (main, second color of gradients, light for text and glows).
-# A stylesheet that defines @bcc_accent, @bcc_accent2 and @bcc_accent_light
-# (the modern theme does) gets these values; other stylesheets are unchanged.
+# batocera.conf: main, second color of gradients, light (text and glows on
+# the dark panel), and the text color drawn on the main color.
+# A stylesheet that defines @bcc_accent, @bcc_accent2, @bcc_accent_light and
+# @bcc_on_accent (the modern theme does) gets these values; other
+# stylesheets are unchanged.
 THEME_COLORS = {
-    "blue":   ("#2f7bff", "#00c2ff", "#7cc4ff"),
-    "orange": ("#ff7a1a", "#ffb02e", "#ffc285"),
-    "purple": ("#8b5cf6", "#c084fc", "#d6b8ff"),
-    "green":  ("#16b364", "#4ade80", "#8af0b0"),
+    "blue":   ("#2f7bff", "#00c2ff", "#7cc4ff", "#ffffff"),
+    "orange": ("#ff7a1a", "#ffb02e", "#ffc285", "#ffffff"),
+    "purple": ("#8b5cf6", "#c084fc", "#d6b8ff", "#ffffff"),
+    "green":  ("#16b364", "#4ade80", "#8af0b0", "#ffffff"),
+    "pink":   ("#e83e8c", "#ff6fb5", "#ffa8d2", "#ffffff"),
+    "red":    ("#e5383b", "#ff6b5b", "#ff9e94", "#ffffff"),
+    "yellow": ("#e8a800", "#ffd23f", "#ffe07a", "#1b1500"),  # dark text: white is hard to read on yellow
 }
 
 def with_theme_color(css_data: bytes) -> bytes:
-    """The stylesheet with its accent colors set to the saved theme color."""
+    """The stylesheet with its accent colors set to the saved theme color,
+    and its backgrounds tinted with it when controlcenter.background is
+    "tinted" (System > Background)."""
     import re
     color = (settings_get("controlcenter.color") or "").lower()
-    if color not in THEME_COLORS:
+    tinted = (settings_get("controlcenter.background") or "").lower() == "tinted"
+    if color not in THEME_COLORS and not tinted:
         return css_data
+    values = THEME_COLORS.get(color, THEME_COLORS["blue"])
+    names = {"bcc_accent": values[0], "bcc_accent2": values[1],
+             "bcc_accent_light": values[2], "bcc_on_accent": values[3]}
+    if tinted:
+        names["bcc_tint"] = values[0]
     text = css_data.decode("utf-8", errors="replace")
-    for name, value in zip(("bcc_accent", "bcc_accent2", "bcc_accent_light"), THEME_COLORS[color]):
+    for name, value in names.items():
         text = re.sub(r"@define-color\s+%s\s+[^;]+;" % name, f"@define-color {name} {value};", text)
     return text.encode("utf-8")
 

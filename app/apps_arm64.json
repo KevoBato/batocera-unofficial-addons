@@ -219,7 +219,7 @@
     },
     {
       "name": "Modern Control Center",
-      "description": "A modern look for Batocera's Control Center (Hotkey + east face button): icons, quick-settings tiles, a translucent panel, a clear highlight for controllers and a choice of theme color (blue, orange, purple, green). Batocera 43+.",
+      "description": "A modern look for Batocera's Control Center (Hotkey + east face button): icons, quick-settings tiles, a translucent panel, a clear highlight for controllers and a choice of theme color (blue, orange, purple, green, pink, red, yellow) with an optional tinted background. Batocera 43+.",
       "categories": [
         "System Utilities"
       ],
