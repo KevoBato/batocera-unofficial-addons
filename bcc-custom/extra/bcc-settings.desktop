@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=BCC Settings
+Comment=Apps, tabs and look of the Batocera Control Center
+Exec=python3 /usr/share/batocera/controlcenter/bcc-settings.py
+Icon=preferences-system
+Terminal=false
+Categories=Settings;batocera.linux;
+StartupWMClass=bcc-settings

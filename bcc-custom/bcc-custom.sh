@@ -2,7 +2,9 @@
 # Installer for Modern Control Center: a modern look for Batocera's Control
 # Center (Hotkey + east face button): icons, quick-settings tiles, a translucent rounded
 # panel (on Batocera's Wayland desktop), soft cards, pill tabs and a clear
-# glowing highlight for controller navigation.
+# glowing highlight for controller navigation. Its Apps tab starts add-ons,
+# Flatpaks and AppImages in their own window, and BCC Settings (F1 >
+# Applications) picks those apps, hides unused tabs and sets the theme.
 #
 # It is Batocera's own Control Center (github.com/lbrpdx/batocera-
 # controlcenter, GPLv3) with small additions, installed in
@@ -15,6 +17,7 @@ app_dir="$install_dir/controlcenter"
 service_file="/userdata/system/services/bcc_custom"
 base_url="https://github.com/batocera-unofficial-addons/batocera-unofficial-addons/raw/main/bcc-custom"
 user_configs="/userdata/system/configs/controlcenter"
+desktop_file="/userdata/system/.local/share/applications/bcc-settings.desktop"
 
 fail() {
     echo "$1"
@@ -27,12 +30,18 @@ fail() {
 echo "Installing $APPNAME..."
 mkdir -p "$app_dir"
 for f in controlcenter.py ui_core.py xml_utils.py shell.py refresh.py log.py gamepads.py \
-         DocViewer.py controlcenter.xml style.css bato-record.gif LICENSE; do
+         DocViewer.py AppsPanel.py apps_catalog.py bcc-settings.py \
+         controlcenter.xml style.css bato-record.gif LICENSE; do
     wget -q --show-progress -O "$app_dir/$f" "$base_url/extra/controlcenter/$f" \
         || fail "Failed to download $f."
 done
-chmod +x "$app_dir/controlcenter.py"
+chmod +x "$app_dir/controlcenter.py" "$app_dir/bcc-settings.py"
 wget -q --show-progress -O "$install_dir/bcc-custom-logo.png" "$base_url/extra/bcc-custom-logo.png"
+
+# BCC Settings in the F1 file manager's Applications menu
+mkdir -p "$(dirname "$desktop_file")"
+wget -q --show-progress -O "$desktop_file" "$base_url/extra/bcc-settings.desktop" \
+    || echo "Could not add BCC Settings to the F1 Applications menu."
 
 # The service lays the add-on's Control Center over Batocera's at every boot
 mkdir -p /userdata/system/services
@@ -46,6 +55,7 @@ bash "$service_file" start || fail "Could not start $APPNAME."
 
 echo ""
 echo "$APPNAME is installed. Press Hotkey + the east (right) face button (B on Xbox-style controllers) to open the Control Center."
+echo "Choose the apps of its Apps tab, the tabs to show and the theme in BCC Settings (F1 > Applications)."
 # Your own Control Center files win over any theme: say so if they exist
 for f in controlcenter.xml style.css; do
     if [ -f "$user_configs/$f" ]; then

@@ -31,12 +31,49 @@ def parse_xml(path: str) -> CCElement:
 
     return parse_node(root)
 
+def list_tabs(root: CCElement) -> list[tuple[str, str]]:
+    """[(target, display)] of the tabs, in order"""
+    tabs = []
+    def walk(node):
+        for c in node.children:
+            if c.kind == "tab":
+                target = (c.attrs.get("target", "") or "").strip()
+                if target:
+                    tabs.append((target, (c.attrs.get("display", "") or target).strip()))
+            walk(c)
+    walk(root)
+    return tabs
+
+def hide_tabs(root: CCElement, targets: set[str]) -> CCElement:
+    """Remove the tabs whose target is in targets, and their content
+    (BCC Settings > Tabs, controlcenter.hiddentabs). One tab always stays."""
+    targets = {t.strip() for t in targets if t.strip()}
+    if not targets:
+        return root
+    shown = [t for t, _d in list_tabs(root) if t not in targets]
+    if not shown:
+        return root
+    def walk(node):
+        keep = []
+        for c in node.children:
+            if c.kind == "tab" and (c.attrs.get("target", "") or "").strip() in targets:
+                continue
+            if c.kind == "hgroup" and node is root:
+                name = (c.attrs.get("name", "") or c.attrs.get("display", "") or "").strip()
+                if name in targets:
+                    continue
+            walk(c)
+            keep.append(c)
+        node.children = keep
+    walk(root)
+    return root
+
 def validate_xml(root: CCElement) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
 
     # Allowed tags
-    allowed_tags = {"features", "vgroup", "hgroup", "feature", "text", "button", "button_confirm", "toggle", "choice", "choice_cmd", "img", "qrcode", "doc", "tab", "progressbar", "switch"}
+    allowed_tags = {"features", "vgroup", "hgroup", "feature", "text", "button", "button_confirm", "toggle", "choice", "choice_cmd", "img", "qrcode", "doc", "tab", "progressbar", "switch", "apps"}
 
     # Requirements per tag (name optional everywhere now)
     required_per_tag = {
@@ -56,6 +93,7 @@ def validate_xml(root: CCElement) -> tuple[list[str], list[str]]:
         "doc": {"display", "content"},  # display for button label, content for document path
         "tab": set(),         # display optional (tab label)
         "progressbar": set(),     # display optional (value or ${...} command), min/max optional
+        "apps": set(),        # grid of apps (apps_catalog.py), columns/iconsize optional
     }
 
     # Known attributes by tag
@@ -77,6 +115,7 @@ def validate_xml(root: CCElement) -> tuple[list[str], list[str]]:
         "doc": {"display", "content", "refresh", "icon", "iconsize"},
         "tab": {"display", "align", "target", "icon", "iconsize"},
         "progressbar": {"display", "min", "max", "refresh", "align"},
+        "apps": {"columns", "iconsize"},
     }
 
     def path_str(stack):

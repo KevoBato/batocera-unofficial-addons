@@ -166,6 +166,14 @@ def main():
         sys.stderr.write(f"WARNING: CSS file not found: {css_path} — running without custom styles.\n")
 
     xml_root = parse_xml(xml_path)
+    # tabs turned off in BCC Settings > Tabs
+    try:
+        from shell import settings_get
+        from xml_utils import hide_tabs
+        hidden = (settings_get("controlcenter.hiddentabs") or "").split(",")
+        hide_tabs(xml_root, set(hidden))
+    except Exception as e:
+        debug_print(f"[STARTUP] hidden tabs: {e}")
     errs, warns = validate_xml(xml_root)
     if warns:
         sys.stderr.write("XML warnings:\n")

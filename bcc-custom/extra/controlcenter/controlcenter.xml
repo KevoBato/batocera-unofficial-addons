@@ -15,6 +15,7 @@
 	<feature name="shortcuts_tabs" display="Quick Access">
 		<tab display="Game" target="Game" icon="input-gaming-symbolic" align="right" if="${curl http://127.0.0.1:1234/runningGame | jq -r '.systemName' | sed 's/^null$//'}" />
 		<tab display="Gun" target="Gun" icon="mark-location-symbolic" if="${curl -s http://127.0.0.1:1234/runningGame | jq -r '.name' | grep -qE '^null$' || ls /var/run/batocera-overlays/gun_help.png}" />
+		<tab display="Apps" target="Apps" icon="view-app-grid-symbolic" />
 		<tab display="System" target="System" icon="preferences-system-symbolic" align="right" />
 		<tab display="Outputs" target="Outputs" icon="video-display-symbolic" />
 		<tab display="Record" target="Record" icon="media-record-symbolic" />
@@ -168,6 +169,12 @@
 			cache="10" />
 	    <text display="${batocera-switch-screen-checker --switch-get | cut -d ';' -f 2}" refresh="3" />
 	  </feature>
+	</hgroup>
+
+	<!-- Apps: start an app in its own window (the ones chosen in BCC Settings;
+	     before any choice, the ports, Flatpaks and AppImages found) -->
+	<hgroup name="Apps" display="Apps">
+		<apps columns="4" iconsize="96" />
 	</hgroup>
 
 	<!-- Theme: the Control Center's own colors (controlcenter.color, controlcenter.background) -->

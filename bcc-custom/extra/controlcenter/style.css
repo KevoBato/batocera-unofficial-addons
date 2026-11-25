@@ -540,3 +540,15 @@ button.cc-tile label { color: inherit; }
 button.cc-tile .cc-tile-name { font-weight: 700; }
 button.cc-tile .cc-tile-state { opacity: 0.75; font-weight: 500; }
 button.cc-tile:checked .cc-tile-state { opacity: 0.9; }
+
+/* ---------- Apps tab (AppsPanel.py) ---------- */
+.cc-apps { padding: 4px 2px; }
+button.cc-app-tile {
+  min-width: 0;
+  padding: 12px 6px 8px 6px;
+  border-radius: 16px;
+}
+.scale-small button.cc-app-tile, .scale-medium button.cc-app-tile { padding: 10px 4px 6px 4px; border-radius: 12px; }
+button.cc-app-tile label { font-weight: 600; }
+.cc-app-running-dot { color: @bcc_accent_light; font-size: 0.7em; }
+button.cc-app-tile.focused-cell .cc-app-running-dot { color: @bcc_on_accent; }

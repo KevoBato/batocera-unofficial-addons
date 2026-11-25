@@ -4007,6 +4007,15 @@ def ui_build_containers(core: UICore, xml_root):
                         doc_row.set_border_width(4)
                         core.build_doc(child, sub, doc_row, pack_end=False)
                         target.pack_start(doc_row, False, False, 3)
+                    elif sub.kind == "apps":
+                        from AppsPanel import AppsPanel
+                        try:
+                            cols = int(sub.attrs.get("columns", "") or 4)
+                            size = int(sub.attrs.get("iconsize", "") or 96)
+                        except ValueError:
+                            cols, size = 4, 96
+                        core._apps_panel = AppsPanel(core, cols, size)
+                        core._apps_panel.build(target)
 
             # If this is tab content, store it
             if is_tab_content and tab_row:

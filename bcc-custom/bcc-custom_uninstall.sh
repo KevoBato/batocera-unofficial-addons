@@ -1,7 +1,7 @@
 #!/bin/bash
 # Uninstaller for Modern Control Center (bcc-custom.sh): Batocera's own
 # Control Center comes back straight away. Your own files in
-# /userdata/system/configs/controlcenter are kept.
+# /userdata/system/configs/controlcenter (and the Apps tab's apps.json) are kept.
 
 APP_NAME="Modern Control Center"
 install_dir="/userdata/system/add-ons/bcc-custom"
@@ -21,5 +21,6 @@ if awk '$2=="/usr/share/batocera/controlcenter" {f=1} END {exit !f}' /proc/mount
     exit 1
 fi
 rm -rf "${install_dir:?}"
+rm -f /userdata/system/.local/share/applications/bcc-settings.desktop
 
 echo "${APP_NAME} has been removed. Batocera's Control Center is back."
