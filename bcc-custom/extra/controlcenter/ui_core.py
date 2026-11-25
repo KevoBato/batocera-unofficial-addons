@@ -42,7 +42,7 @@ except Exception:
 from refresh import RefreshTask, ExpandRefreshTask, DEFAULT_REFRESH_SEC, Debouncer, run_off_main_thread
 from shell import run_shell_capture, run_shell_capture_cached, run_shell_capture_set_to_cache, run_shell_capture_lines, run_shell_cache_lookup, normalize_bool_str, get_primary_geometry, expand_command_string, expand_command_string_cached, extract_commands, shell_cache_has_all, warm_shell_cache
 
-# Theme colors for System > Theme color, saved as controlcenter.color in
+# Theme colors for Theme > Color, saved as controlcenter.color in
 # batocera.conf: main, second color of gradients, light (text and glows on
 # the dark panel), and the text color drawn on the main color.
 # A stylesheet that defines @bcc_accent, @bcc_accent2, @bcc_accent_light and
@@ -61,7 +61,7 @@ THEME_COLORS = {
 def with_theme_color(css_data: bytes) -> bytes:
     """The stylesheet with its accent colors set to the saved theme color,
     and its backgrounds tinted with it when controlcenter.background is
-    "tinted" (System > Background)."""
+    "tinted" (Theme > Background)."""
     import re
     color = (settings_get("controlcenter.color") or "").lower()
     tinted = (settings_get("controlcenter.background") or "").lower() == "tinted"
@@ -107,7 +107,7 @@ def handle_afterclick_after(core: 'UICore', afterclick_attr: str):
         # Force the UI to re-read all shell commands and toggle visibility
         GLib.idle_add(core.schedule_recompute_conditionals)
     elif afterclick == "bcc_recolor":
-        # Re-apply the theme color picked in System > Theme color, live:
+        # Re-apply the theme color picked in Theme > Color, live:
         # reload the stylesheet with it, then refresh the labels
         def _recolor():
             core.apply_css()

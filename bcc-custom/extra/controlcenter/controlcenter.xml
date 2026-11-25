@@ -18,6 +18,7 @@
 		<tab display="System" target="System" icon="preferences-system-symbolic" align="right" />
 		<tab display="Outputs" target="Outputs" icon="video-display-symbolic" />
 		<tab display="Record" target="Record" icon="media-record-symbolic" />
+		<tab display="Theme" target="Theme" icon="preferences-color-symbolic" />
 	</feature>
 
 	<!-- RECORDING TAB -->
@@ -134,23 +135,6 @@
                         <choice_cmd display="${batocera-resolution listOutputs}" action="batocera-settings-set controlcenter.screen" action_arg="${batocera-resolution listOutputs}" afterclick="bcc_rescreen" cache="5" />
                         <text display="Now: ${[ -n &quot;$(batocera-settings-get controlcenter.screen | tr -d &apos;&quot;&apos;)&quot; ] &amp;&amp; batocera-settings-get controlcenter.screen | tr -d &apos;&quot;&apos; || echo auto}" refresh="1" />
                 </feature>
-                <!-- Theme color: the color of the selected tab, buttons and bars (controlcenter.color) -->
-                <feature name="ThemeColor" display="Theme color">
-                        <choice display="Blue (default)" action="batocera-settings-set controlcenter.color blue" afterclick="bcc_recolor" />
-                        <choice display="Orange" action="batocera-settings-set controlcenter.color orange" afterclick="bcc_recolor" />
-                        <choice display="Purple" action="batocera-settings-set controlcenter.color purple" afterclick="bcc_recolor" />
-                        <choice display="Green" action="batocera-settings-set controlcenter.color green" afterclick="bcc_recolor" />
-                        <choice display="Pink" action="batocera-settings-set controlcenter.color pink" afterclick="bcc_recolor" />
-                        <choice display="Red" action="batocera-settings-set controlcenter.color red" afterclick="bcc_recolor" />
-                        <choice display="Yellow" action="batocera-settings-set controlcenter.color yellow" afterclick="bcc_recolor" />
-                        <text display="${case &quot;$(batocera-settings-get controlcenter.color)&quot; in orange) echo Orange;; purple) echo Purple;; green) echo Green;; pink) echo Pink;; red) echo Red;; yellow) echo Yellow;; *) echo Blue;; esac}" refresh="5" />
-                </feature>
-                <!-- Background: dark, or tinted with the theme color (controlcenter.background) -->
-                <feature name="ThemeBackground" display="Background">
-                        <choice display="Dark (default)" action="batocera-settings-set controlcenter.background dark" afterclick="bcc_recolor" />
-                        <choice display="Tinted with the theme color" action="batocera-settings-set controlcenter.background tinted" afterclick="bcc_recolor" />
-                        <text display="${[ &quot;$(batocera-settings-get controlcenter.background)&quot; = tinted ] &amp;&amp; echo Tinted || echo Dark}" refresh="5" />
-                </feature>
 		<vgroup>
 		  <feature display="Network IP address:">
 			<text display='${printf "%s " "$(ip -4 addr show | grep -oP "(?&lt;=inet\s)\d+(\.\d+){3}" | grep -v "127.0.0.1" | head -n1)" ; for d in /sys/class/net/*; do n=$(basename "$d"); if [ "$n" != lo ]; then printf "%s: %s, " "$n" "$(cat "$d/operstate")"; fi; done | sed "s/, $//"}' refresh="5" align="left" />
@@ -184,6 +168,27 @@
 			cache="10" />
 	    <text display="${batocera-switch-screen-checker --switch-get | cut -d ';' -f 2}" refresh="3" />
 	  </feature>
+	</hgroup>
+
+	<!-- Theme: the Control Center's own colors (controlcenter.color, controlcenter.background) -->
+	<hgroup name="Theme" display="Theme">
+		<!-- Theme color: the color of the selected tab, buttons and bars (controlcenter.color) -->
+		<feature name="ThemeColor" display="Color">
+			<choice display="Blue (default)" action="batocera-settings-set controlcenter.color blue" afterclick="bcc_recolor" />
+			<choice display="Orange" action="batocera-settings-set controlcenter.color orange" afterclick="bcc_recolor" />
+			<choice display="Purple" action="batocera-settings-set controlcenter.color purple" afterclick="bcc_recolor" />
+			<choice display="Green" action="batocera-settings-set controlcenter.color green" afterclick="bcc_recolor" />
+			<choice display="Pink" action="batocera-settings-set controlcenter.color pink" afterclick="bcc_recolor" />
+			<choice display="Red" action="batocera-settings-set controlcenter.color red" afterclick="bcc_recolor" />
+			<choice display="Yellow" action="batocera-settings-set controlcenter.color yellow" afterclick="bcc_recolor" />
+			<text display="${case &quot;$(batocera-settings-get controlcenter.color)&quot; in orange) echo Orange;; purple) echo Purple;; green) echo Green;; pink) echo Pink;; red) echo Red;; yellow) echo Yellow;; *) echo Blue;; esac}" refresh="5" />
+		</feature>
+		<!-- Background: dark, or tinted with the theme color (controlcenter.background) -->
+		<feature name="ThemeBackground" display="Background">
+			<choice display="Dark (default)" action="batocera-settings-set controlcenter.background dark" afterclick="bcc_recolor" />
+			<choice display="Tinted with the theme color" action="batocera-settings-set controlcenter.background tinted" afterclick="bcc_recolor" />
+			<text display="${[ &quot;$(batocera-settings-get controlcenter.background)&quot; = tinted ] &amp;&amp; echo Tinted || echo Dark}" refresh="5" />
+		</feature>
 	</hgroup>
 	<vgroup name="Bottom bar" role="footer">
 		<feature display="CPU:">

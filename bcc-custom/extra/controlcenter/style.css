@@ -12,7 +12,7 @@
  */
 
 /* Theme colors. The Control Center swaps the accent colors for the one
-   picked in System > Theme color (controlcenter.color in batocera.conf), so
+   picked in Theme > Color (controlcenter.color in batocera.conf), so
    use these, not literal colors, for anything that should follow it:
    bcc_accent (main), bcc_accent2 (second color of gradients),
    bcc_accent_light (text, outlines and glows on the dark panel) and
@@ -24,7 +24,7 @@
 
 /* Backgrounds: the dark colors below, each blended with a little bcc_tint.
    bcc_tint is a neutral dark here, which leaves them as they are; with
-   System > Background > Tinted (controlcenter.background=tinted) the
+   Theme > Background > Tinted (controlcenter.background=tinted) the
    Control Center sets it to the theme color. */
 @define-color bcc_tint #10141c;
 @define-color bcc_bg mix(#0b0e14, @bcc_tint, 0.10);
