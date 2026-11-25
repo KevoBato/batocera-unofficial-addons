@@ -11,12 +11,21 @@
  * (BCC loads that file instead of its default; delete it to go back.)
  */
 
+/* Accent colors. The Control Center swaps these three for the color picked
+   in System > Theme color (controlcenter.color in batocera.conf), so use
+   them, not literal blues, for anything that should follow the theme color:
+   bcc_accent (main), bcc_accent2 (second color of gradients), bcc_accent_light
+   (text, outlines and glows on the dark panel). */
+@define-color bcc_accent #2f7bff;
+@define-color bcc_accent2 #00c2ff;
+@define-color bcc_accent_light #7cc4ff;
+
 /* ---------- Palette ----------------------------------------------------
  * bg      #0b0e14 .. #121620   window
  * card    #161b26              sections
  * raised  rgba(255,255,255,.06) controls
  * text    #eef1f7 / muted #8b93a7
- * accent  #2f7bff -> #00c2ff   (Batocera blue to cyan)
+ * accent  @bcc_accent -> @bcc_accent2   (Batocera blue to cyan)
  * danger  #ff5d6c
  * ---------------------------------------------------------------------- */
 
@@ -48,7 +57,7 @@
 /* ---------- Text ---------- */
 .header, .item-text { color: #eef1f7; }
 .item-text { font-weight: 500; }
-.value { color: #7cc4ff; font-weight: 600; }
+.value { color: @bcc_accent_light; font-weight: 600; }
 
 /* ---------- Section cards (hgroup frames) ---------- */
 frame { border: none; background: none; box-shadow: none; }
@@ -68,7 +77,7 @@ frame > border {
 
 /* Section heading: small, spaced, accent coloured (no box) */
 .group-title {
-  color: #7cc4ff;
+  color: @bcc_accent_light;
   background-color: transparent;
   font-weight: 700;
   letter-spacing: 1.6px;
@@ -124,7 +133,7 @@ frame > border {
 
 .section-separator {
   background-color: transparent;
-  background-image: linear-gradient(90deg, rgba(124, 196, 255, 0), rgba(124, 196, 255, 0.35), rgba(124, 196, 255, 0));
+  background-image: linear-gradient(90deg, alpha(@bcc_accent_light, 0), alpha(@bcc_accent_light, 0.35), alpha(@bcc_accent_light, 0));
   min-height: 1px;
   margin: 14px 0;
 }
@@ -167,7 +176,7 @@ button.cc-button:hover,
 button.cc-choice:hover,
 button.choice-option:hover {
   background-color: rgba(255, 255, 255, 0.11);
-  border-color: rgba(124, 196, 255, 0.35);
+  border-color: alpha(@bcc_accent_light, 0.35);
 }
 
 /* Selected / focused: accent gradient + glow (the main "you are here") */
@@ -177,10 +186,10 @@ button.cc-button:focus,
 button.cc-choice.choice-selected,
 button.choice-option.choice-selected,
 button.focused-cell {
-  background-color: #2f7bff;
-  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+  background-color: @bcc_accent;
+  background-image: linear-gradient(135deg, @bcc_accent 0%, @bcc_accent2 100%);
   border-color: rgba(255, 255, 255, 0.35);
-  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.28), 0 6px 18px rgba(0, 120, 255, 0.45);
+  box-shadow: 0 0 0 3px alpha(@bcc_accent2, 0.28), 0 6px 18px alpha(@bcc_accent, 0.45);
   color: #ffffff;
 }
 button.cc-button.choice-selected label,
@@ -234,15 +243,15 @@ button.cc-toggle {
 }
 .scale-small button.cc-toggle, .scale-medium button.cc-toggle { padding: 4px 10px; min-width: 40px; }
 button.cc-toggle:checked {
-  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+  background-image: linear-gradient(135deg, @bcc_accent 0%, @bcc_accent2 100%);
   border-color: rgba(255, 255, 255, 0.3);
   color: #ffffff;
 }
 button.cc-toggle.choice-selected,
 button.cc-toggle.focused-cell,
 button.cc-toggle:focus {
-  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.35);
-  border-color: #7cc4ff;
+  box-shadow: 0 0 0 3px alpha(@bcc_accent2, 0.35);
+  border-color: @bcc_accent_light;
 }
 
 /* ---------- Tabs: pill segmented control ---------- */
@@ -266,8 +275,8 @@ button.cc-tab:hover { background-color: rgba(255, 255, 255, 0.06); }
 button.cc-tab:hover label { color: #c9cfdc; }
 
 button.cc-tab:checked {
-  background-color: rgba(47, 123, 255, 0.18);
-  border-color: rgba(124, 196, 255, 0.45);
+  background-color: alpha(@bcc_accent, 0.18);
+  border-color: alpha(@bcc_accent_light, 0.45);
   margin-bottom: 0;
 }
 button.cc-tab:checked label { color: #ffffff; font-weight: 700; }
@@ -275,21 +284,21 @@ button.cc-tab:checked label { color: #ffffff; font-weight: 700; }
 button.cc-tab:checked.choice-selected,
 button.cc-tab:checked.focused-cell,
 button.cc-tab.focused-cell {
-  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+  background-image: linear-gradient(135deg, @bcc_accent 0%, @bcc_accent2 100%);
   border-color: rgba(255, 255, 255, 0.35);
-  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.28), 0 6px 18px rgba(0, 120, 255, 0.4);
+  box-shadow: 0 0 0 3px alpha(@bcc_accent2, 0.28), 0 6px 18px alpha(@bcc_accent, 0.4);
 }
 button.cc-tab.focused-cell label { color: #ffffff; }
 
 /* ---------- Choice popups and confirm dialogs ---------- */
 .choice-selected {
-  background-color: rgba(47, 123, 255, 0.25);
-  border-color: #7cc4ff;
+  background-color: alpha(@bcc_accent, 0.25);
+  border-color: @bcc_accent_light;
   color: #ffffff;
 }
 
 .confirm-dialog {
-  border: 1px solid rgba(124, 196, 255, 0.35);
+  border: 1px solid alpha(@bcc_accent_light, 0.35);
   border-radius: 20px;
   background-color: #121620;
   background-image: linear-gradient(165deg, #1a2130 0%, #11151e 100%);
@@ -326,8 +335,8 @@ dialog .dialog-action-area,
 .scale-small .cc-switch, .scale-medium .cc-switch { min-width: 34px; min-height: 18px; }
 
 .cc-switch:checked {
-  background-color: #2f7bff;
-  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+  background-color: @bcc_accent;
+  background-image: linear-gradient(135deg, @bcc_accent 0%, @bcc_accent2 100%);
 }
 
 .cc-switch > slider {
@@ -347,7 +356,7 @@ dialog .dialog-action-area,
 .cc-switch.focused-cell,
 .cc-switch:focus {
   border-color: #ffffff;
-  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.35), 0 6px 16px rgba(0, 120, 255, 0.4);
+  box-shadow: 0 0 0 3px alpha(@bcc_accent2, 0.35), 0 6px 16px alpha(@bcc_accent, 0.4);
 }
 
 /* ---------- Progress bars ---------- */
@@ -371,12 +380,12 @@ dialog .dialog-action-area,
 .scale-small .cc-progressbar > trough, .scale-medium .cc-progressbar > trough { min-width: 60px; min-height: 6px; }
 
 .cc-progressbar > trough > progress {
-  background-color: #2f7bff;
-  background-image: linear-gradient(90deg, #2f7bff 0%, #00c2ff 100%);
+  background-color: @bcc_accent;
+  background-image: linear-gradient(90deg, @bcc_accent 0%, @bcc_accent2 100%);
   border-radius: 999px;
   border: none;
   min-height: 10px;
-  box-shadow: 0 0 10px rgba(0, 194, 255, 0.45);
+  box-shadow: 0 0 10px alpha(@bcc_accent2, 0.45);
 }
 .scale-small .cc-progressbar > trough > progress,
 .scale-medium .cc-progressbar > trough > progress { min-height: 6px; }
@@ -488,10 +497,10 @@ button.cc-toggle.cc-tile {
 button.cc-toggle.cc-tile:hover { background-color: rgba(255, 255, 255, 0.1); }
 
 button.cc-toggle.cc-tile:checked {
-  background-color: #2f7bff;
-  background-image: linear-gradient(135deg, #2f7bff 0%, #00c2ff 100%);
+  background-color: @bcc_accent;
+  background-image: linear-gradient(135deg, @bcc_accent 0%, @bcc_accent2 100%);
   border-color: rgba(255, 255, 255, 0.3);
-  box-shadow: 0 10px 28px rgba(0, 120, 255, 0.4);
+  box-shadow: 0 10px 28px alpha(@bcc_accent, 0.4);
   color: #ffffff;
 }
 
@@ -499,7 +508,7 @@ button.cc-toggle.cc-tile.choice-selected,
 button.cc-toggle.cc-tile.focused-cell,
 button.cc-toggle.cc-tile:focus {
   border-color: #ffffff;
-  box-shadow: 0 0 0 3px rgba(0, 194, 255, 0.4), 0 10px 28px rgba(0, 120, 255, 0.35);
+  box-shadow: 0 0 0 3px alpha(@bcc_accent2, 0.4), 0 10px 28px alpha(@bcc_accent, 0.35);
 }
 
 button.cc-tile label { color: inherit; }

@@ -42,6 +42,28 @@ except Exception:
 from refresh import RefreshTask, ExpandRefreshTask, DEFAULT_REFRESH_SEC, Debouncer, run_off_main_thread
 from shell import run_shell_capture, run_shell_capture_cached, run_shell_capture_set_to_cache, run_shell_capture_lines, run_shell_cache_lookup, normalize_bool_str, get_primary_geometry, expand_command_string, expand_command_string_cached, extract_commands, shell_cache_has_all, warm_shell_cache
 
+# Theme colors for System > Theme color, saved as controlcenter.color in
+# batocera.conf: (main, second color of gradients, light for text and glows).
+# A stylesheet that defines @bcc_accent, @bcc_accent2 and @bcc_accent_light
+# (the modern theme does) gets these values; other stylesheets are unchanged.
+THEME_COLORS = {
+    "blue":   ("#2f7bff", "#00c2ff", "#7cc4ff"),
+    "orange": ("#ff7a1a", "#ffb02e", "#ffc285"),
+    "purple": ("#8b5cf6", "#c084fc", "#d6b8ff"),
+    "green":  ("#16b364", "#4ade80", "#8af0b0"),
+}
+
+def with_theme_color(css_data: bytes) -> bytes:
+    """The stylesheet with its accent colors set to the saved theme color."""
+    import re
+    color = (settings_get("controlcenter.color") or "").lower()
+    if color not in THEME_COLORS:
+        return css_data
+    text = css_data.decode("utf-8", errors="replace")
+    for name, value in zip(("bcc_accent", "bcc_accent2", "bcc_accent_light"), THEME_COLORS[color]):
+        text = re.sub(r"@define-color\s+%s\s+[^;]+;" % name, f"@define-color {name} {value};", text)
+    return text.encode("utf-8")
+
 # handle_afterclick_before : actions to do before the call
 # handle_afterclick_after  : actions to do after the call
 # the limit is not so well done while in some case, we want the action to be done after (refresh ui after a command)
@@ -71,6 +93,14 @@ def handle_afterclick_after(core: 'UICore', afterclick_attr: str):
     if afterclick == "bcc_refresh":
         # Force the UI to re-read all shell commands and toggle visibility
         GLib.idle_add(core.schedule_recompute_conditionals)
+    elif afterclick == "bcc_recolor":
+        # Re-apply the theme color picked in System > Theme color, live:
+        # reload the stylesheet with it, then refresh the labels
+        def _recolor():
+            core.apply_css()
+            core.schedule_recompute_conditionals()
+            return False
+        GLib.idle_add(_recolor)
     elif afterclick == "bcc_rescreen":
         # Re-apply the saved screen selection and re-layout the window for
         # the selected monitor's geometry, live (no restart needed).
@@ -899,12 +929,17 @@ class UICore:
                 css_data = f.read()
                 debug_print(f"[CSS] CSS file size: {len(css_data)} bytes")
 
-                prov.load_from_data(css_data)
+                prov.load_from_data(with_theme_color(css_data))
+            # Called again by bcc_recolor: replace the previous stylesheet
+            screen = Gdk.Screen.get_default()
+            if getattr(self, "_css_provider", None) is not None:
+                Gtk.StyleContext.remove_provider_for_screen(screen, self._css_provider)
             Gtk.StyleContext.add_provider_for_screen(
-                Gdk.Screen.get_default(),
+                screen,
                 prov,
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
             )
+            self._css_provider = prov
         except Exception as e:
             debug_print(f"[CSS] CSS load failed: {e}")
             import traceback
