@@ -189,6 +189,14 @@
 			<choice display="Tinted with the theme color" action="batocera-settings-set controlcenter.background tinted" afterclick="bcc_recolor" />
 			<text display="${[ &quot;$(batocera-settings-get controlcenter.background)&quot; = tinted ] &amp;&amp; echo Tinted || echo Dark}" refresh="5" />
 		</feature>
+		<!-- Position: the usual centered window, or a narrower full-height
+		     side panel docked left or right (controlcenter.position) -->
+		<feature name="ThemePosition" display="Position">
+			<choice display="Center (default)" action="batocera-settings-set controlcenter.position center" afterclick="bcc_reposition" />
+			<choice display="Side panel, left" action="batocera-settings-set controlcenter.position left" afterclick="bcc_reposition" />
+			<choice display="Side panel, right" action="batocera-settings-set controlcenter.position right" afterclick="bcc_reposition" />
+			<text display="${case &quot;$(batocera-settings-get controlcenter.position)&quot; in left) echo Left;; right) echo Right;; *) echo Center;; esac}" refresh="5" />
+		</feature>
 	</hgroup>
 	<vgroup name="Bottom bar" role="footer">
 		<feature display="CPU:">

@@ -77,6 +77,18 @@ def with_theme_color(css_data: bytes) -> bytes:
         text = re.sub(r"@define-color\s+%s\s+[^;]+;" % name, f"@define-color {name} {value};", text)
     return text.encode("utf-8")
 
+def side_panel_position() -> str:
+    """"left" or "right" when controlcenter.position (Theme > Position) asks
+    for a side panel: a narrower window, the full screen height, docked to
+    that edge. "" for the usual centered window."""
+    pos = (settings_get("controlcenter.position") or "").strip().lower()
+    return pos if pos in ("left", "right") else ""
+
+SIDE_GAP = 12  # space between a side panel and the screen edges
+
+def side_panel_width(sw: int) -> int:
+    return min(sw, max(560, int(sw * 0.40)))
+
 # handle_afterclick_before : actions to do before the call
 # handle_afterclick_after  : actions to do after the call
 # the limit is not so well done while in some case, we want the action to be done after (refresh ui after a command)
@@ -121,6 +133,12 @@ def handle_afterclick_after(core: 'UICore', afterclick_attr: str):
             core._apply_screen_selection()
             return False
         GLib.idle_add(_rescreen)
+    elif afterclick == "bcc_reposition":
+        # Re-apply Theme > Position (centered, or a side panel), live
+        def _reposition():
+            core.apply_position()
+            return False
+        GLib.idle_add(_reposition)
     elif afterclick.startswith("${") and afterclick.endswith("}"):
         # Command substitution - execute the command
         cmd = afterclick[2:-1]  # Remove ${ and }
@@ -632,7 +650,15 @@ class UICore:
                 width_margin = (sw - width) // 2
                 height_margin = (sh - height) // 5
 
-        debug_print(f"[DPI] Wayland layout on {sw}x{sh}: win:{width}x{max_height} margins:{width_margin}x{height_margin}")
+        side = "" if (self.fullscreen or self.window_size or sw < 1280) else side_panel_position()
+        self._side = side
+        if side:
+            # Side panel: narrower, full height, docked to one edge
+            width = side_panel_width(sw)
+            max_height = sh - 2 * SIDE_GAP
+            scale_class = "medium"  # the compact look fits the narrower panel
+
+        debug_print(f"[DPI] Wayland layout on {sw}x{sh}: win:{width}x{max_height} margins:{width_margin}x{height_margin} side:{side or 'none'}")
 
         # Update stored dimensions (used by rows, reference sizing, X11-less paths)
         self._window_width = width
@@ -651,12 +677,107 @@ class UICore:
                 pass
         self._scale_class = scale_class
 
+        self._set_side_class(win, side)
+
         # Apply margins and resize the surface
-        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, height_margin)
-        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.BOTTOM, 4 * height_margin)
-        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, width_margin)
-        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.RIGHT, width_margin)
+        if side:
+            far = max(0, sw - width - SIDE_GAP)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, SIDE_GAP)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.BOTTOM, SIDE_GAP)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, SIDE_GAP if side == "left" else far)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.RIGHT, far if side == "left" else SIDE_GAP)
+        else:
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, height_margin)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.BOTTOM, 4 * height_margin)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, width_margin)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.RIGHT, width_margin)
         win.resize(width, max_height)
+
+    # "cc-side" (plus "cc-side-left"/"cc-side-right") on the window while it
+    # is a side panel, so a theme can style it differently
+    def _set_side_class(self, win: Gtk.Window, side: str):
+        try:
+            ctx = win.get_style_context()
+            for cls in ("cc-side", "cc-side-left", "cc-side-right"):
+                ctx.remove_class(cls)
+            if side:
+                ctx.add_class("cc-side")
+                ctx.add_class(f"cc-side-{side}")
+            for lbl in getattr(self, "_tab_row_labels", []):
+                lbl.set_visible(not side)
+            for lbl in getattr(self, "_side_wrap_labels", []):
+                self._set_side_wrap(lbl, side)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _set_side_wrap(lbl: Gtk.Label, side: str):
+        lbl.set_line_wrap(bool(side))
+        lbl.set_max_width_chars(36 if side else -1)
+
+    # Theme > Position changed: re-layout the window (Wayland: margins on the
+    # layer surface; X11: size and move)
+    def apply_position(self):
+        win = self.window
+        if not win:
+            return
+        try:
+            if getattr(self, "_is_wayland", False):
+                display = Gdk.Display.get_default()
+                mon = getattr(self, "_selected_monitor", None) or display.get_monitor(0)
+                self._apply_wayland_layout(win, mon)
+            else:
+                self._x11_layout(win)
+                win.resize(self._window_width, self._max_height)
+                self._x11_place(win)
+        except Exception as e:
+            debug_print(f"[POSITION] re-layout failed: {e}")
+
+    # X11: a side panel's size, from the screen size (else the centered size
+    # computed at build time, kept in _center_size)
+    def _x11_layout(self, win: Gtk.Window):
+        if not hasattr(self, "_center_size"):
+            self._center_size = (self._window_width, self._max_height)
+        sw, sh = self._screen_width, self._screen_height
+        side = "" if (self.fullscreen or self.window_size or sw < 1280) else side_panel_position()
+        self._side = side
+        if not hasattr(self, "_center_scale"):
+            self._center_scale = self._scale_class
+        if side:
+            self._window_width = side_panel_width(sw)
+            self._max_height = sh - 2 * SIDE_GAP
+            scale_class = "medium"  # the compact look fits the narrower panel
+        else:
+            self._window_width, self._max_height = self._center_size
+            scale_class = self._center_scale
+        if scale_class != self._scale_class:
+            ctx = win.get_style_context()
+            ctx.remove_class(f"scale-{self._scale_class}")
+            ctx.add_class(f"scale-{scale_class}")
+            self._scale_class = scale_class
+        self._set_side_class(win, side)
+        if self.fullscreen or self.window_size:
+            return
+        geom = Gdk.Geometry()
+        geom.min_width = geom.max_width = self._window_width
+        geom.max_height = self._max_height
+        win.set_geometry_hints(None, geom, Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE)
+
+    def _x11_place(self, win: Gtk.Window):
+        side = getattr(self, "_side", "")
+        if side == "left":
+            x = self._screen_x + SIDE_GAP
+        elif side == "right":
+            x = self._screen_x + self._screen_width - self._window_width - SIDE_GAP
+        else:
+            x = self._screen_x + (self._screen_width - self._window_width) // 2
+        if side:
+            y = self._screen_y + SIDE_GAP
+        elif self._screen_height - self._max_height > 10:
+            y = self._screen_y + 10
+        else:
+            y = self._screen_y
+        win.move(max(0, x), max(0, y))
 
     def build_window(self):
         display = Gdk.Display.get_default()
@@ -774,6 +895,11 @@ class UICore:
         self._screen_height = sh
         self._scale_class = scale_class
 
+        # X11: Theme > Position may make it a side panel
+        if not is_wayland:
+            self._x11_layout(win)
+            width, max_height = self._window_width, self._max_height
+
         # Set default size - use max_height as starting point
         if not is_wayland:
             win.set_default_size(width, max_height)
@@ -815,12 +941,7 @@ class UICore:
                     win.fullscreen()
             # On X11, position immediately after realize (non-fullscreen)
             elif not is_wayland:
-                center_x = self._screen_x + (self._screen_width - self._window_width) // 2
-                if self._screen_height - self._max_height > 10:
-                    top_y = self._screen_y + 10
-                else:
-                    top_y = self._screen_y
-                win.move(max(0, center_x), max(0, top_y))
+                self._x11_place(win)
 
         def on_map(_w):
             # Ensure window is shown
@@ -4732,6 +4853,11 @@ def _build_feature_row(core: UICore, feat) -> Gtk.EventBox:
 
         # Add spacer only for tabs to push them to the right
         if has_tabs:
+            # A side panel (Theme > Position) has no room for the tab
+            # row's label: _set_side_class hides it there
+            name_lbl.set_no_show_all(True)
+            name_lbl.set_visible(not getattr(core, "_side", ""))
+            core._tab_row_labels = getattr(core, "_tab_row_labels", []) + [name_lbl]
             spacer = Gtk.Box()
             spacer.set_hexpand(True)
             row_box.pack_start(spacer, True, True, 0)
@@ -4847,6 +4973,12 @@ def _build_feature_row(core: UICore, feat) -> Gtk.EventBox:
                 lbl.set_line_wrap(True)
                 lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
                 lbl.set_max_width_chars(40)
+            else:
+                # A side panel (Theme > Position) is too narrow for long
+                # values (audio device names): _set_side_class wraps them there
+                lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                core._side_wrap_labels = getattr(core, "_side_wrap_labels", []) + [lbl]
+                core._set_side_wrap(lbl, getattr(core, "_side", ""))
             row_box.pack_start(lbl, False, False, 8)
             disp = (sub.attrs.get("display", "") or "").strip()
             refresh = float(sub.attrs.get("refresh", feat.attrs.get("refresh", DEFAULT_REFRESH_SEC)))

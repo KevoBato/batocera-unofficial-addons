@@ -478,6 +478,11 @@ dialog .dialog-action-area,
 .popup-root.cc-translucent.scale-small .cc-outer,
 .popup-root.cc-translucent.scale-medium .cc-outer { border-radius: 14px; }
 .popup-root.cc-translucent.scale-xlarge .cc-outer { border-radius: 56px; }
+/* Side panel (Theme > Position): a little tighter */
+.popup-root.cc-side .cc-outer { padding: 12px 12px; }
+.popup-root.cc-translucent.cc-side .cc-outer { border-radius: 22px; }
+.popup-root.cc-side button.cc-tab,
+.popup-root.cc-side button.cc-tab.cc-has-icon { padding: 3px 8px; min-width: 0; margin: 0 1px; }
 
 /* ---------- Icons ---------- */
 .cc-icon { color: inherit; }
