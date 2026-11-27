@@ -338,6 +338,24 @@ BUILTIN_STRINGS: Dict[str, str] = {
     "theme_yellow": "Yellow",
     "theme_gray": "Gray",
     "theme_white": "White",
+    "dash_install": "Install",
+    "dash_reinstall": "Reinstall",
+    "dash_add_queue": "Add to queue",
+    "dash_remove_queue": "Remove from queue",
+    "dash_details": "Details",
+    "dash_category": "Category",
+    "dash_menu": "Menu",
+    "dash_in_queue": "In queue",
+    "dash_added": "Added to queue",
+    "dash_removed": "Removed from queue",
+    "dash_installed_of": "{installed} of {total} installed",
+    "dash_script_updated": "Installer updated",
+    "run_title": "Installing {count} add-ons",
+    "run_title_one": "Installing 1 add-on",
+    "run_done": "done",
+    "run_running": "installing",
+    "run_waiting": "waiting",
+    "run_output": "Installer output",
 }
 
 def check_language_exists(lang_data: Tuple[str, str, str], results: list, lock: threading.Lock):
@@ -776,6 +794,7 @@ def load_console_fonts():
         return pygame.font.SysFont("DejaVu Sans", S(size), bold=bold)
     return {
         "hero": sys_font(30, bold=True),
+        "display": sys_font(42, bold=True),
         "tile": sys_font(20, bold=True),
         "body": sys_font(17),
         "small": sys_font(14),
@@ -2493,6 +2512,30 @@ def draw_icon(surf, kind: str, center, size: int, color):
         pygame.draw.circle(surf, color, (cx, cy), int(size * 0.35), w)
 
 
+def draw_button_glyph(surf, key: str, center, size: int, fallback_fill=None, fallback_fg=None):
+    """One controller button (A, B, X, Y, LB, RB, START) as the current
+    controller draws it: its icon when there is one, else a keycap."""
+    mapped = STYLE_ICON_MAP.get(PAD_STYLE, STYLE_ICON_MAP["generic"]).get(key, key)
+    icon = BUTTON_ICONS.get("START" if key == "START" else mapped) or BUTTON_ICONS.get(key)
+    text = key
+    if PAD_STYLE == "keyboard":
+        icon = None
+        text = KEYBOARD_HINT_MAP.get(key) or KEYBOARD_HINT_MAP.get(mapped) or key
+    if icon is not None:
+        w = max(1, int(icon.get_width() * size / max(1, icon.get_height())))
+        img = _scale_and_style_icon(icon, w, size)  # lightens dark icons, as the hint bar does
+        surf.blit(img, img.get_rect(center=center))
+        return img.get_width()
+    font = UI_FONTS["small"]
+    label = font.render(text, True, fallback_fg or FG)
+    w = max(size, label.get_width() + S(12))
+    cap = pygame.Rect(0, 0, w, size)
+    cap.center = center
+    pygame.draw.rect(surf, fallback_fill or CARD_HI, cap, border_radius=size // 2)
+    surf.blit(label, label.get_rect(center=cap.center))
+    return w
+
+
 def draw_footer(surf, hints: str, status: str = "") -> int:
     """Bottom button bar: status text on the left, button hints on the right.
     Returns the bar height."""
@@ -3233,6 +3276,448 @@ class MenuScreen(BaseScreen):
                     f"{t('input')}: {input_style_label()}")
 
         # Search keyboard over the dimmed home screen
+        if self.search_mode:
+            self.keyboard.draw(screen, self.search_query)
+
+# The categories the dashboard shows as tabs, in this order
+DASH_CATEGORIES = [
+    ("Games", "games"),
+    ("Windows Freeware", "windows_freeware"),
+    ("Game Utilities", "game_utilities"),
+    ("System Utilities", "system_utilities"),
+    ("Developer Tools", "developer_tools"),
+    ("Docker Menu", "docker_menu"),
+]
+
+
+def app_category_label(app: str) -> str:
+    """The (translated) name of the first category an add-on is in, or ""."""
+    for cat, key in DASH_CATEGORIES:
+        if app in CATEGORIES.get(cat, []):
+            return t(key)
+    return ""
+
+
+class DashboardScreen(MenuScreen):
+    """Home screen, console style: category tabs (LB/RB), the focused add-on
+    in a large banner with its actions (A install, X queue, Y details), and
+    a row of the category's add-ons. Up moves to the menu buttons: search,
+    then the top-level items that aren't categories (Custom Wine, Updater,
+    Doctor, Settings, Exit), which open just as they do from MenuScreen."""
+
+    def __init__(self):
+        super().__init__(t("main_title"), TOP_LEVEL or get_top_level())
+        self.stats = self.calculate_stats()
+        self.tab = 0
+        self.card = {}           # category -> focused card
+        self.first = {}          # category -> first card on screen
+        self.zone = "row"        # "row" (add-ons) or "menu" (buttons at the top)
+        self.menu_idx = 0
+        self.toast = ""
+        self.toast_time = 0.0
+        self.pending_install = None  # set by the reinstall confirmation
+
+    # The data on screen
+
+    def tabs(self) -> List[Tuple[str, str]]:
+        """(English category, label) for each category that has add-ons."""
+        tabs = [(cat, t(key)) for cat, key in DASH_CATEGORIES if CATEGORIES.get(cat)]
+        return tabs or [(cat, t(key)) for cat, key in DASH_CATEGORIES]
+
+    def category(self) -> str:
+        tabs = self.tabs()
+        self.tab = max(0, min(self.tab, len(tabs) - 1))
+        return tabs[self.tab][0]
+
+    def apps(self) -> List[str]:
+        return sorted(CATEGORIES.get(self.category(), []), key=str.lower)
+
+    def focused(self) -> str | None:
+        apps = self.apps()
+        if not apps:
+            return None
+        cat = self.category()
+        i = max(0, min(self.card.get(cat, 0), len(apps) - 1))
+        self.card[cat] = i
+        return apps[i]
+
+    def menu_items(self) -> List[Tuple[str, str, str]]:
+        """(id, label, icon) for the menu buttons; id is a TOP_LEVEL name."""
+        cats = {t(key) for _cat, key in DASH_CATEGORIES}
+        icons = {t("custom_wine"): "wine", t("updater"): "update", t("doctor"): "doctor",
+                 t("settings"): "gear", t("exit"): "power"}
+        items = [("__search__", t("search"), "search")]
+        for name, _desc in (self.all_items or []):
+            if name not in cats:
+                items.append((name, name, icons.get(name, "gear")))
+        return items
+
+    # Input
+
+    def show_toast(self, message: str):
+        self.toast = message
+        self.toast_time = pygame.time.get_ticks() / 1000.0
+
+    def nav(self, dx: int, dy: int):
+        if self.zone == "menu":
+            if dy > 0:
+                self.zone = "row"
+            elif dx:
+                self.menu_idx = max(0, min(self.menu_idx + dx, len(self.menu_items()) - 1))
+            return
+        if dy < 0:
+            self.zone = "menu"
+            return
+        if dx:
+            apps = self.apps()
+            if apps:
+                cat = self.category()
+                self.card[cat] = max(0, min(self.card.get(cat, 0) + dx, len(apps) - 1))
+
+    def switch_tab(self, step: int):
+        self.tab = (self.tab + step) % len(self.tabs())
+        self.zone = "row"
+
+    def press_a(self):
+        if self.zone == "menu":
+            self.open_menu_item()
+            return
+        key = self.focused()
+        if not key:
+            return
+        if key == "Custom Wine" and "WineTypeMenu" in globals():  # not on arm64
+            push_screen(globals()["WineTypeMenu"]())
+            return
+        if key not in APPS:
+            return
+        if is_installed(key):
+            def again():
+                self.pending_install = key  # started from update(), once the dialog has closed
+            push_screen(ConfirmDialog(t("reinstall_confirmation"), [
+                f"{key} {t('previously_installed')}",
+                f"{t('last_installed')} {get_last_install_date(key)}",
+                "",
+                t("install_again"),
+            ], again, lambda: None))
+        else:
+            push_screen(RunListScreen([(key, APPS[key])], title=key))
+
+    def press_x(self):
+        key = self.focused()
+        if self.zone != "row" or not key or key not in APPS:
+            return
+        item = (key, APPS[key])
+        if item in INSTALL_QUEUE:
+            INSTALL_QUEUE.remove(item)
+            self.show_toast(f"{t('dash_removed')}: {key}")
+        else:
+            INSTALL_QUEUE.append(item)
+            self.show_toast(f"{t('dash_added')}: {key}")
+
+    def press_y(self):
+        key = self.focused()
+        if self.zone != "row" or not key:
+            return
+        lines = [DESCRIPTIONS.get(key, "")]
+        if is_installed(key):
+            lines += ["", f"{t('last_installed')} {get_last_install_date(key)}"]
+        updated = script_date(key)
+        if updated:
+            lines += ["" if len(lines) == 1 else None, f"{t('dash_script_updated')}: {updated}"]
+        push_screen(InfoDialog(key, [ln for ln in lines if ln is not None]))
+
+    def open_menu_item(self):
+        items = self.menu_items()
+        ident = items[max(0, min(self.menu_idx, len(items) - 1))][0]
+        if ident == "__search__":
+            self.search_mode = True
+            self.search_query = ""
+            return
+        # The same actions as the old home screen
+        names = [name for name, _desc in self.items]
+        if ident in names:
+            self.idx = names.index(ident)
+            MenuScreen.activate(self)
+
+    def handle(self, events):
+        if self.search_mode:
+            MenuScreen.handle(self, events)  # the on-screen keyboard and search
+            return
+        analog_v, analog_h = process_analog_navigation(events)
+        if analog_v or analog_h:
+            self.nav(analog_h, analog_v)
+        for e in events:
+            if e.type == pygame.QUIT:
+                clean_exit(0)
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_LEFT:
+                    self.nav(-1, 0)
+                if e.key == pygame.K_RIGHT:
+                    self.nav(1, 0)
+                if e.key == pygame.K_UP:
+                    self.nav(0, -1)
+                if e.key == pygame.K_DOWN:
+                    self.nav(0, 1)
+                if e.key in (pygame.K_q, pygame.K_PAGEUP):
+                    self.switch_tab(-1)
+                if e.key in (pygame.K_e, pygame.K_PAGEDOWN, pygame.K_TAB):
+                    self.switch_tab(1)
+                if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.press_a()
+                if e.key == pygame.K_x:
+                    self.press_x()
+                if e.key == pygame.K_y:
+                    self.press_y()
+                if e.key == pygame.K_SPACE:
+                    push_screen(QueueScreen())
+                if e.key == pygame.K_SLASH:
+                    self.search_mode = True
+                    self.search_query = ""
+                    return
+                if e.key == pygame.K_ESCAPE:
+                    if self.zone == "menu":
+                        self.zone = "row"
+                    else:
+                        clean_exit(0)
+            if e.type == pygame.JOYHATMOTION:
+                x, y = e.value
+                if x or y:
+                    self.nav(x, -y)
+            if e.type == pygame.JOYBUTTONDOWN:
+                if e.button == BTN_A:
+                    self.press_a()
+                if e.button == BTN_X:
+                    self.press_x()
+                if e.button == BTN_Y:
+                    self.press_y()
+                if e.button == BTN_START:
+                    push_screen(QueueScreen())
+                if e.button == BTN_LB:
+                    self.switch_tab(-1)
+                if e.button == BTN_RB:
+                    self.switch_tab(1)
+                if e.button == BTN_B and self.zone == "menu":
+                    self.zone = "row"
+
+    def update(self):
+        if self.pending_install:
+            key, self.pending_install = self.pending_install, None
+            if key in APPS:
+                push_screen(RunListScreen([(key, APPS[key])], title=key))
+
+    # Drawing
+
+    def draw_pill_button(self, x: int, y: int, h: int, key: str, label: str, primary: bool) -> int:
+        """An action button: the controller button, then its label. Returns its width."""
+        f = UI_FONTS
+        text = f["tile"].render(label, True, ON_ACCENT if primary else FG)
+        glyph = h - S(16)
+        w = S(8) + glyph + S(12) + text.get_width() + S(22)
+        rect = pygame.Rect(x, y, w, h)
+        if primary:
+            pygame.draw.rect(screen, ACCENT, rect, border_radius=h // 2)
+        else:
+            pygame.draw.rect(screen, CARD_HI, rect, border_radius=h // 2)
+            pygame.draw.rect(screen, DIALOG_BORDER, rect, width=max(1, S(1)), border_radius=h // 2)
+        draw_button_glyph(screen, key, (x + S(8) + glyph // 2, rect.centery), glyph)
+        screen.blit(text, (x + S(8) + glyph + S(12), rect.centery - text.get_height() // 2))
+        return w
+
+    def draw(self):
+        draw_background(screen)
+        f = UI_FONTS
+        m = S(48)
+        top = S(24)
+        header_h = S(46)
+        now = pygame.time.get_ticks() / 1000.0
+
+        # Header, left: the BUA logo (or name)
+        x = m
+        drew_logo = False
+        if WHEEL_SURF is not None:
+            try:
+                trimmed = WHEEL_SURF.subsurface(WHEEL_SURF.get_bounding_rect()).copy()
+                scale = header_h / trimmed.get_height()
+                logo = pygame.transform.smoothscale(trimmed, (int(trimmed.get_width() * scale), header_h))
+                screen.blit(logo, (x, top))
+                x += logo.get_width()
+                drew_logo = True
+            except Exception:
+                pass
+        if not drew_logo:
+            img = f["hero"].render("BUA", True, FG)
+            screen.blit(img, (x, top + (header_h - img.get_height()) // 2))
+            x += img.get_width()
+
+        # Header, right: the menu buttons; the focused one shows its name
+        items = self.menu_items()
+        self.menu_idx = max(0, min(self.menu_idx, len(items) - 1))
+        btn = S(44)
+        right = W - m
+        widths = []
+        for i, (_ident, label, _icon) in enumerate(items):
+            on = self.zone == "menu" and i == self.menu_idx
+            widths.append(btn + S(10) + f["body"].size(label)[0] + S(18) if on else btn)
+        bx = right - sum(widths) - S(10) * (len(items) - 1)
+        for i, (ident, label, icon) in enumerate(items):
+            on = self.zone == "menu" and i == self.menu_idx
+            rect = pygame.Rect(bx, top + (header_h - btn) // 2, widths[i], btn)
+            if on:
+                pygame.draw.rect(screen, ACCENT, rect, border_radius=btn // 2)
+                color = ON_ACCENT
+            else:
+                pygame.draw.rect(screen, CARD, rect, border_radius=btn // 2)
+                pygame.draw.rect(screen, DIALOG_BORDER, rect, width=max(1, S(1)), border_radius=btn // 2)
+                color = (240, 96, 96) if ident == t("exit") else ICON_IDLE
+            draw_icon(screen, icon, (rect.x + btn // 2, rect.centery), S(22), color)
+            if on:
+                text = f["body"].render(label, True, ON_ACCENT)
+                screen.blit(text, (rect.x + btn + S(2), rect.centery - text.get_height() // 2))
+            bx += widths[i] + S(10)
+
+        # Header, middle: LB, the category tabs, RB
+        tabs = self.tabs()
+        cat = self.category()
+        stats = (self.stats or {}).get("category_stats", {})
+        glyph_h = S(26)
+        lb_w = draw_button_glyph(pygame.Surface((1, 1), pygame.SRCALPHA), "LB", (0, 0), glyph_h)
+        rb_w = draw_button_glyph(pygame.Surface((1, 1), pygame.SRCALPHA), "RB", (0, 0), glyph_h)
+        tab_h = S(40)
+        tabs_left, tabs_right = m, W - m
+        avail = tabs_right - tabs_left - lb_w - rb_w - S(16)
+        labels = []
+        for i, (c, label) in enumerate(tabs):
+            total = stats.get(c, (0, len(CATEGORIES.get(c, []))))[1]
+            name_img = f["tile" if i == self.tab else "body"].render(label, True, ON_ACCENT if i == self.tab else TEXT_SOFT)
+            count_img = f["small"].render(str(total), True, ON_ACCENT if i == self.tab else MUTED)
+            labels.append((name_img, count_img, name_img.get_width() + S(6) + count_img.get_width() + S(26)))
+        # Show as many tabs as fit, always including the current one
+        start, end = 0, len(tabs)
+        while sum(w for _n, _c, w in labels[start:end]) + S(6) * (end - start - 1) > avail and end - start > 1:
+            if self.tab - start > end - 1 - self.tab:
+                start += 1
+            else:
+                end -= 1
+        tx = tabs_left
+        cy = top + header_h + S(18) + tab_h // 2
+        tx += draw_button_glyph(screen, "LB", (tx + lb_w // 2, cy), glyph_h) + S(8)
+        for i in range(start, end):
+            name_img, count_img, w = labels[i]
+            rect = pygame.Rect(tx, cy - tab_h // 2, w, tab_h)
+            if i == self.tab:
+                pygame.draw.rect(screen, ACCENT, rect, border_radius=tab_h // 2)
+            screen.blit(name_img, (rect.x + S(13), rect.centery - name_img.get_height() // 2))
+            screen.blit(count_img, (rect.x + S(13) + name_img.get_width() + S(6), rect.centery - count_img.get_height() // 2 + S(1)))
+            tx += w + S(6)
+        draw_button_glyph(screen, "RB", (tx + S(2) + rb_w // 2, cy), glyph_h)
+
+        # The focused add-on, large
+        footer_h = S(54)
+        hero = pygame.Rect(m, cy + tab_h // 2 + S(18), W - 2 * m, S(236))
+        draw_tile(screen, hero, radius=S(24))
+        key = self.focused()
+        apps = self.apps()
+        pad = S(26)
+        if key is None:
+            draw_text(screen, t("no_addons_category"), f["body"], MUTED, (hero.x + pad, hero.y + pad))
+        else:
+            box = pygame.Rect(hero.x + pad, hero.y + pad, hero.h - 2 * pad, hero.h - 2 * pad)
+            pygame.draw.rect(screen, LOGO_PANEL, box, border_radius=S(20))
+            logo = app_logo(key, (box.w - S(36), box.h - S(36)))
+            if logo is not None:
+                screen.blit(logo, logo.get_rect(center=box.center))
+            else:
+                mono = box.inflate(-S(60), -S(60))
+                draw_monogram(screen, mono, key, f["monogram_big"])
+            tx0 = box.right + S(36)
+            text_w = hero.right - pad - tx0
+            y = box.y + S(4)
+            kicker = f["small"].render(dict(tabs).get(cat, cat).upper(), True, ACCENT)
+            screen.blit(kicker, (tx0, y))
+            kicker_y, kicker_right = y, tx0 + kicker.get_width()
+            y += kicker.get_height() + S(6)
+            draw_text(screen, fit_text(key, f["display"], text_w), f["display"], FG, (tx0, y))
+            y += f["display"].get_height() + S(6)
+            desc = DESCRIPTIONS.get(key, "")
+            for line in wrap(desc, text_w, f["body"])[:2]:
+                draw_text(screen, line, f["body"], TEXT_SOFT, (tx0, y))
+                y += f["body"].get_height() + S(4)
+            installed = is_installed(key)
+            queued = key in APPS and (key, APPS[key]) in INSTALL_QUEUE
+            bh = S(48)
+            by = box.bottom - bh
+            bx = tx0
+            cx = kicker_right + S(14)
+            if installed:
+                chip = draw_chip(screen, t("installed"), f["small"], (cx, kicker_y - S(4)), BG, SUCCESS)
+                cx = chip.right + S(8)
+            if queued:
+                draw_chip(screen, t("dash_in_queue"), f["small"], (cx, kicker_y - S(4)), ON_ACCENT, ACCENT)
+            bx += self.draw_pill_button(bx, by, bh, "A", t("dash_reinstall") if installed else t("dash_install"), True) + S(12)
+            bx += self.draw_pill_button(bx, by, bh, "X", t("dash_remove_queue") if queued else t("dash_add_queue"), False) + S(12)
+            self.draw_pill_button(bx, by, bh, "Y", t("dash_details"), False)
+
+        # The category's add-ons in a row
+        row_top = hero.bottom + S(24)
+        title = f["tile"].render(dict(tabs).get(cat, cat), True, FG)
+        screen.blit(title, (m, row_top))
+        inst, total = stats.get(cat, (sum(1 for k in apps if is_installed(k)), len(apps)))
+        sub = f["small"].render(t("dash_installed_of").format(installed=inst, total=total), True, MUTED)
+        screen.blit(sub, (m + title.get_width() + S(12), row_top + title.get_height() - sub.get_height() - S(2)))
+        cards_top = row_top + title.get_height() + S(14)
+        name_h = f["body"].get_height() + S(10)
+        cw = max(S(90), min(S(160), H - footer_h - S(14) - name_h - cards_top))
+        gap = S(18)
+        full = max(1, (W - 2 * m + gap) // (cw + gap))
+        focus = self.card.get(cat, 0)
+        first = self.first.get(cat, 0)
+        if focus < first:
+            first = focus
+        if focus >= first + full:
+            first = focus - full + 1
+        first = max(0, min(first, max(0, len(apps) - full)))
+        self.first[cat] = first
+        cx = m
+        for i in range(first, len(apps)):
+            if cx > W:
+                break
+            app = apps[i]
+            on = self.zone == "row" and i == focus
+            rect = pygame.Rect(cx, cards_top, cw, cw)
+            draw_tile(screen, rect, on, radius=S(18))
+            logo = app_logo(app, (int(cw * 0.62), int(cw * 0.62)))
+            if logo is not None:
+                screen.blit(logo, logo.get_rect(center=rect.center))
+            else:
+                mono = pygame.Rect(0, 0, int(cw * 0.55), int(cw * 0.55))
+                mono.center = rect.center
+                draw_monogram(screen, mono, app, f["monogram"])
+            if is_installed(app):
+                draw_check_badge(screen, (rect.right - S(20), rect.y + S(20)), S(12), SUCCESS)
+            if app in APPS and (app, APPS[app]) in INSTALL_QUEUE:
+                draw_chip(screen, t("queued"), f["small"], (rect.x + S(10), rect.y + S(10)), ON_ACCENT, ACCENT)
+            draw_text(screen, fit_text(app, f["body"], cw), f["body"], FG if on else TEXT_SOFT,
+                      (rect.x, rect.bottom + S(8)))
+            cx += cw + gap
+
+        # A short message after X, above the button bar
+        if self.toast and now - self.toast_time < 2.0:
+            img = f["body"].render(self.toast, True, ON_ACCENT)
+            chip = pygame.Rect(0, 0, img.get_width() + S(32), img.get_height() + S(16))
+            chip.topright = (hero.right - S(22), hero.y + S(22))
+            pygame.draw.rect(screen, ACCENT, chip, border_radius=chip.h // 2)
+            screen.blit(img, img.get_rect(center=chip.center))
+
+        status = f"{t('installed')}: {(self.stats or {}).get('total_installed', 0)} {t('of')} {len(APPS)} {t('addons')}"
+        if INSTALL_QUEUE:
+            status += f"     {t('queue')}: {len(INSTALL_QUEUE)}"
+        if self.zone == "menu":
+            hints = f"A={t('hint_open')} | B={t('hint_return')}"
+        else:
+            hints = (f"A={t('dash_install')} | X={t('dash_add_queue')} | Y={t('dash_details')} | "
+                     f"LB+RB={t('dash_category')} | START={t('queue')}")
+        draw_footer(screen, hints, status)
+
         if self.search_mode:
             self.keyboard.draw(screen, self.search_query)
 
@@ -5057,30 +5542,13 @@ export -f desktop
         completed = len(self.job_results)
         success_count = sum(self.job_results) if self.job_results else 0
         fail_count = completed - success_count
-        if self.started and not self.runner.done:
-            name = self.jobs[self.current][0]
-            status_text = f"{job_verb(name)} {completed + 1} / {total_jobs}: {job_label(name)}"
-        elif self.all_finished:
-            if fail_count and not success_count:
-                status_text = t("failed")
-            elif fail_count:
-                status_text = f"{success_count} {t('succeeded')}, {fail_count} {t('failed')}"
-            elif all(name.endswith(UNINSTALL_SUFFIX) for name, _cmd in self.jobs):
-                status_text = t("completed")
-            else:
-                status_text = t("all_complete")
-        else:
-            status_text = t("preparing")
-        top = draw_screen_header(self.title, status_text)
-        if self.started and not self.runner.done:
-            draw_spinner(screen, (W - margin - S(16), S(28) + S(18)), S(16), ACCENT)
-        draw_footer(screen, f"X={t('hint_view_log')} | B={t('hint_return')}")
+        running = self.started and not self.runner.done and not self.all_finished
+        waiting = total_jobs - completed - (1 if running else 0)
 
         # The running job's own progress: a percentage in its newest line
         # (curl, wget), kept at its highest so the bar never goes back.
         # A download fills 90% of the job's share of the bar; the rest
         # fills when the job ends, since it still has to unpack and set up.
-        running = self.started and not self.runner.done and not self.all_finished
         job_frac, job_line = job_progress(self.runner) if running else (None, "")
         if job_frac is not None:
             self.job_best[self.current] = max(job_frac, self.job_best.get(self.current, 0.0))
@@ -5091,72 +5559,139 @@ export -f desktop
         else:
             self.bar_shown = max(self.bar_shown, self.bar_shown + (target - self.bar_shown) * 0.15)
 
-        # Overall progress
-        summary = f"{t('completed')}: {completed}/{total_jobs}"
-        if fail_count > 0:
-            summary += f" ({success_count} {t('succeeded')}, {fail_count} {t('failed')})"
-        draw_text(screen, summary, f["small"], MUTED, (margin, top - S(12)))
-        if job_best is not None or (total_jobs > 1 and completed):
-            pct = f["small"].render(f"{int(self.bar_shown * 100)}%", True, FG)
-            screen.blit(pct, (W - margin - pct.get_width(), top - S(12)))
-        bar = pygame.Rect(margin, top + f["small"].get_height(), W - 2 * margin, S(6))
+        # Header: what is happening, the counts, and the overall bar
+        top = S(28)
+        if self.all_finished:
+            if fail_count and not success_count:
+                heading = t("failed")
+            elif fail_count:
+                heading = f"{success_count} {t('succeeded')}, {fail_count} {t('failed')}"
+            elif all(name.endswith(UNINSTALL_SUFFIX) for name, _cmd in self.jobs):
+                heading = t("completed")
+            else:
+                heading = t("all_complete")
+        elif self.title in (t("installing_from_queue"), t("running_installers")):
+            heading = t("run_title_one") if total_jobs == 1 else t("run_title").format(count=total_jobs)
+        else:
+            heading = self.title
+        counts = [(completed, t("run_done")), (1 if running else 0, t("run_running")), (max(0, waiting), t("run_waiting"))]
+        cx = W - margin
+        parts = []
+        for n, (num, word) in enumerate(counts):
+            parts.append(f["body"].render(f" {word}" + ("  ·  " if n < len(counts) - 1 else ""), True, MUTED))
+            parts.append(f["tile"].render(str(num), True, FG))
+        for img in parts:  # right to left: last word first
+            cx -= img.get_width()
+        counts_x = cx
+        draw_text(screen, fit_text(heading, f["hero"], counts_x - margin - S(24)), f["hero"], FG, (margin, top))
+        x = counts_x
+        base = top + f["hero"].get_height() - S(4)
+        for n in range(len(counts)):
+            num_img, word_img = parts[2 * n + 1], parts[2 * n]
+            screen.blit(num_img, (x, base - num_img.get_height()))
+            x += num_img.get_width()
+            screen.blit(word_img, (x, base - word_img.get_height()))
+            x += word_img.get_width()
+        if running:
+            draw_spinner(screen, (counts_x - S(28), top + f["hero"].get_height() // 2), S(12), ACCENT)
+        bar = pygame.Rect(margin, top + f["hero"].get_height() + S(16), W - 2 * margin, S(8))
         pygame.draw.rect(screen, CARD_HI, bar, border_radius=bar.h // 2)
         if total_jobs and self.bar_shown > 0:
             done = bar.copy()
             done.w = max(bar.h, int(bar.w * self.bar_shown))
-            pygame.draw.rect(screen, SUCCESS if not fail_count else (240, 184, 80), done, border_radius=bar.h // 2)
+            pygame.draw.rect(screen, ACCENT if not fail_count else (240, 184, 80), done, border_radius=bar.h // 2)
 
-        # One row per job, keeping the current one in view
-        pitch, row_h = S(70), S(60)
-        list_top = bar.bottom + S(24)
+        footer = f"X={t('hint_view_log')} | B={t('hint_return')}"
+        if self.all_finished:
+            footer = f"A={t('hint_return')} | X={t('hint_view_log')}"
+        footer_h = draw_footer(screen, footer)
+
+        # Left: one card per job, keeping the current one in view
+        body_top = bar.bottom + S(26)
+        body_bottom = H - footer_h - S(20)
+        list_w = min(S(560), (W - 2 * margin) * 46 // 100)
+        card_h, run_h, gap = S(80), S(104), S(12)
         focus = self.current if self.started else 0
-        first, rows = list_window(total_jobs, focus, list_top, pitch)
-        badge_r = S(13)
+        rows = max(1, (body_bottom - body_top - (run_h - card_h) + gap) // (card_h + gap))
+        first = max(0, min(focus - rows // 2, total_jobs - rows))
+        y = body_top
         for i in range(first, min(total_jobs, first + rows)):
             name, _cmd = self.jobs[i]
-            rect = pygame.Rect(margin, list_top + (i - first) * pitch, W - 2 * margin, row_h)
-            badge = (rect.x + S(22) + badge_r, rect.centery)
-            text_right = rect.right - S(20)
+            label = job_label(name)
+            is_running = running and i == self.current
+            h = run_h if is_running else card_h
+            rect = pygame.Rect(margin, y, list_w, h)
+            draw_tile(screen, rect, is_running, radius=S(18), fill=CARD_HI if is_running else None)
+            icon = pygame.Rect(rect.x + S(16), rect.y + (card_h - S(52)) // 2, S(52), S(52))
+            draw_app_icon(screen, icon, label, f["monogram_small"])
+            tx = icon.right + S(16)
+            right = rect.right - S(18)
+            # The state on the right
             if i < completed:
                 ok = self.job_results[i]
-                status_color = SUCCESS if ok else (232, 92, 92)
-                status = t("completed") if ok else t("failed")
-                draw_tile(screen, rect, radius=S(12))
-                (draw_check_badge if ok else draw_cross_badge)(screen, badge, badge_r, status_color)
-            elif i == self.current and self.started:
-                status_color = (240, 184, 80)
-                status = job_verb(name)
-                draw_tile(screen, rect, True, radius=S(12), accent=status_color)
-                draw_spinner(screen, badge, badge_r, status_color)
-                # Show that the job is moving: its percentage while it prints
-                # one, else its newest line (e.g. unpacking after a download)
-                if job_frac is not None:
-                    status += f"  {int(job_best * 100)}%"
-                elif job_line:
-                    status += f"  ·  {job_line}"
-                if job_best is not None:
-                    job_bar = pygame.Rect(0, 0, min(S(260), rect.w // 4), S(6))
-                    job_bar.midright = (rect.right - S(24), rect.centery)
-                    text_right = job_bar.x - S(20)
-                    pygame.draw.rect(screen, CARD, job_bar, border_radius=job_bar.h // 2)
-                    job_bar.w = max(job_bar.h, int(job_bar.w * job_best))
-                    pygame.draw.rect(screen, status_color, job_bar, border_radius=job_bar.h // 2)
+                color = SUCCESS if ok else (232, 92, 92)
+                word = f["body"].render(t("completed") if ok else t("failed"), True, color)
+                screen.blit(word, (right - word.get_width(), icon.centery - word.get_height() // 2))
+                badge_x = right - word.get_width() - S(22)
+                (draw_check_badge if ok else draw_cross_badge)(screen, (badge_x, icon.centery), S(12), color)
+                right = badge_x - S(22)
+                status = app_category_label(label)
+            elif is_running:
+                pct = f"{int(job_best * 100)}%" if job_best is not None else ""
+                if pct:
+                    img = f["tile"].render(pct, True, ACCENT)
+                    screen.blit(img, (right - img.get_width(), icon.centery - img.get_height() // 2))
+                    right -= img.get_width() + S(16)
+                else:
+                    draw_spinner(screen, (right - S(12), icon.centery), S(12), ACCENT)
+                    right -= S(40)
+                status = job_line or t("preparing")
             else:
-                status_color = MUTED
-                status = t("queued")
-                draw_tile(screen, rect, radius=S(12))
-                pygame.draw.circle(screen, MUTED, badge, badge_r, max(2, S(2)))
-            x = badge[0] + badge_r + S(18)
-            y = rect.centery - (f["tile"].get_height() + f["small"].get_height() + S(2)) // 2
-            draw_text(screen, fit_text(job_label(name), f["tile"], text_right - x), f["tile"], FG, (x, y))
-            draw_text(screen, fit_text(status, f["small"], text_right - x), f["small"], status_color,
-                      (x, y + f["tile"].get_height() + S(2)))
+                word = f["body"].render(t("queued"), True, MUTED)
+                screen.blit(word, (right - word.get_width(), icon.centery - word.get_height() // 2))
+                right -= word.get_width() + S(16)
+                status = app_category_label(label)
+            ty = icon.centery - (f["tile"].get_height() + (f["small"].get_height() + S(2) if status else 0)) // 2
+            draw_text(screen, fit_text(label, f["tile"], right - tx), f["tile"], FG, (tx, ty))
+            if status:
+                draw_text(screen, fit_text(status, f["small"], right - tx), f["small"], TEXT_SOFT if is_running else MUTED,
+                          (tx, ty + f["tile"].get_height() + S(2)))
+            if is_running:
+                jb = pygame.Rect(rect.x + S(16), rect.bottom - S(22), rect.w - S(32), S(6))
+                pygame.draw.rect(screen, TRACK, jb, border_radius=jb.h // 2)
+                if job_best:
+                    jb.w = max(jb.h, int(jb.w * job_best))
+                    pygame.draw.rect(screen, ACCENT, jb, border_radius=jb.h // 2)
+            y += h + gap
+        if first + rows < total_jobs:
+            draw_text(screen, t("and_more_items").format(count=total_jobs - first - rows), f["small"], MUTED,
+                      (margin, min(y, body_bottom - f["small"].get_height())))
 
-        remaining_below = total_jobs - (first + rows)
-        if remaining_below > 0:
-            draw_text(screen, t("and_more_items").format(count=remaining_below), f["small"], MUTED,
-                      (margin, list_top + rows * pitch))
-
+        # Right: the installer's output, live
+        panel = pygame.Rect(margin + list_w + S(28), body_top, W - 2 * margin - list_w - S(28), body_bottom - body_top)
+        draw_tile(screen, panel, radius=S(18), fill=FIELD)
+        head_h = f["body"].get_height() + S(24)
+        shown = self.jobs[min(self.current, total_jobs - 1)][0] if total_jobs else ""
+        head = f"{job_label(shown)}  ·  {t('run_output')}" if shown else t("run_output")
+        draw_text(screen, fit_text(head, f["body"], panel.w - S(110)), f["body"], FG, (panel.x + S(18), panel.y + S(12)))
+        if running:
+            live = f["small"].render("LIVE", True, MUTED)
+            lx = panel.right - S(18) - live.get_width()
+            screen.blit(live, (lx, panel.y + S(12) + (f["body"].get_height() - live.get_height()) // 2))
+            pygame.draw.circle(screen, SUCCESS, (lx - S(10), panel.y + S(12) + f["body"].get_height() // 2), S(4))
+        pygame.draw.line(screen, LINE, (panel.x, panel.y + head_h), (panel.right - 1, panel.y + head_h), 1)
+        line_h = f["small"].get_height() + S(4)
+        inner = pygame.Rect(panel.x + S(18), panel.y + head_h + S(12), panel.w - S(36), panel.h - head_h - S(24))
+        n_rows = max(1, inner.h // line_h)
+        with self.runner.lock:
+            recent = list(self.runner.lines[-n_rows:])
+        view = []
+        for ln in recent:
+            view.extend([ln] if f["small"].size(ln)[0] <= inner.w else wrap(ln, inner.w, f["small"]))
+        ly = inner.y
+        for ln in view[-n_rows:]:
+            draw_text(screen, ln, f["small"], TEXT_SOFT, (inner.x, ly))
+            ly += line_h
 
 # ------------------------------
 # Updater Screen
@@ -6410,7 +6945,7 @@ def pop_screen():
 
 
 def main():
-    push_screen(MenuScreen(t("main_title"), TOP_LEVEL))
+    push_screen(DashboardScreen())
 
     # Check for controller mapping before showing changelog
     if not _apply_saved_button_map_if_any():
