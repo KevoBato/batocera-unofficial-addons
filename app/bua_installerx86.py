@@ -4127,7 +4127,7 @@ class LibraryScreen(BaseScreen):
         cols = max(1, (grid_w + gap) // (S(250) + gap))
         self.cols = cols
         card_w = (grid_w - (cols - 1) * gap) // cols
-        card_h = S(92)
+        card_h = S(76)
         rows_visible = max(1, (body_bottom - S(20) - grid_top + gap) // (card_h + gap))
         if not apps:
             draw_text(screen, t("no_addons_category"), f["body"], MUTED, (gx0, grid_top))
@@ -4146,7 +4146,7 @@ class LibraryScreen(BaseScreen):
                 app = apps[i]
                 on = self.zone == "grid" and i == self.idx
                 draw_tile(screen, rect, on, radius=S(16))
-                icon = pygame.Rect(rect.x + S(14), rect.centery - S(30), S(60), S(60))
+                icon = pygame.Rect(rect.x + S(12), rect.centery - S(26), S(52), S(52))
                 draw_addon_logo(icon, app, f["monogram_small"])
                 tx = icon.right + S(14)
                 tw = rect.right - S(14) - tx
@@ -4157,7 +4157,7 @@ class LibraryScreen(BaseScreen):
                 if queued(app):
                     badges.append("queued")
                 name_w -= S(26) * len(badges)
-                ny = rect.y + S(14)
+                ny = rect.centery - f["tile"].get_height() // 2
                 name = fit_text(app, f["tile"], name_w)
                 draw_text(screen, name, f["tile"], FG, (tx, ny))
                 bxx = tx + f["tile"].size(name)[0] + S(16)
@@ -4168,10 +4168,6 @@ class LibraryScreen(BaseScreen):
                     else:
                         pygame.draw.circle(screen, color, (bxx, ny + f["tile"].get_height() // 2), S(7))
                     bxx += S(26)
-                dy = ny + f["tile"].get_height() + S(4)
-                for line in wrap(DESCRIPTIONS.get(app, ""), tw, f["small"])[:2]:
-                    draw_text(screen, line, f["small"], MUTED, (tx, dy))
-                    dy += f["small"].get_height() + S(2)
             if total_rows > rows_visible:
                 track = pygame.Rect(gx1 + S(10), grid_top, S(4), rows_visible * (card_h + gap) - gap)
                 pygame.draw.rect(screen, CARD, track, border_radius=track.w // 2)
