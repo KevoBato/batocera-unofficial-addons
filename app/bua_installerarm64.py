@@ -2403,8 +2403,54 @@ def draw_chip(surf, text: str, font, pos, fg, bg):
     return rect
 
 
+_ICON_CACHE: Dict[tuple, pygame.Surface] = {}
+ICON_SUPERSAMPLE = 4
+
+
 def draw_icon(surf, kind: str, center, size: int, color):
-    """Simple line icons drawn with pygame, so no image files are needed."""
+    """Simple line icons drawn with pygame, so no image files are needed.
+    Each is drawn at 4x and scaled down smoothly, so its edges are
+    anti-aliased, and kept for reuse."""
+    key = (kind, int(size), tuple(color))
+    img = _ICON_CACHE.get(key)
+    if img is None:
+        ss = ICON_SUPERSAMPLE
+        big = max(8, int(size * 1.5)) * ss
+        canvas = pygame.Surface((big, big), pygame.SRCALPHA)
+        _draw_icon_shape(canvas, kind, (big // 2, big // 2), int(size) * ss, color)
+        img = pygame.transform.smoothscale(canvas, (big // ss, big // ss))
+        if len(_ICON_CACHE) > 512:
+            _ICON_CACHE.clear()
+        _ICON_CACHE[key] = img
+    surf.blit(img, img.get_rect(center=(int(center[0]), int(center[1]))))
+
+
+def _arc_band(surf, color, center, radius: float, start_deg: float, end_deg: float, width: float,
+              round_caps: bool = True):
+    """A thick arc as one filled shape (pygame's own thick arc leaves gaps),
+    from start_deg to end_deg counter-clockwise, 0 degrees pointing right."""
+    cx, cy = center
+    steps = max(12, int(abs(end_deg - start_deg) / 4))
+    outer, inner = [], []
+    for k in range(steps + 1):
+        a = math.radians(start_deg + (end_deg - start_deg) * k / steps)
+        outer.append((cx + (radius + width / 2) * math.cos(a), cy - (radius + width / 2) * math.sin(a)))
+        inner.append((cx + (radius - width / 2) * math.cos(a), cy - (radius - width / 2) * math.sin(a)))
+    pygame.draw.polygon(surf, color, outer + inner[::-1])
+    if round_caps:
+        for deg in (start_deg, end_deg):
+            a = math.radians(deg)
+            pygame.draw.circle(surf, color, (cx + radius * math.cos(a), cy - radius * math.sin(a)), width / 2)
+
+
+def _round_line(surf, color, a, b, width: float):
+    """A thick line with rounded ends."""
+    pygame.draw.line(surf, color, a, b, max(1, int(width)))
+    for p in (a, b):
+        pygame.draw.circle(surf, color, p, width / 2)
+
+
+def _draw_icon_shape(surf, kind: str, center, size: int, color):
     cx, cy = center
     half = size / 2
     w = max(2, size // 12)
@@ -2469,14 +2515,21 @@ def draw_icon(surf, kind: str, center, size: int, color):
         pygame.draw.line(surf, color, P(0, 0.12), P(0, 0.46), w)
         pygame.draw.line(surf, color, P(-0.26, 0.48), P(0.26, 0.48), w)
     elif kind == "update":
-        r = pygame.Rect(0, 0, int(size * 0.74), int(size * 0.74))
-        r.center = (cx, cy)
-        pygame.draw.arc(surf, color, r, math.radians(50), math.radians(330), w)
-        rad = r.w / 2
-        tip = (cx + rad * math.cos(math.radians(50)), cy - rad * math.sin(math.radians(50)))
-        a = size * 0.2
-        pygame.draw.line(surf, color, tip, (tip[0] - a, tip[1] - a * 0.15), w)
-        pygame.draw.line(surf, color, tip, (tip[0] + a * 0.1, tip[1] + a), w)
+        # A circular arrow: an open ring with its head pointing into the gap
+        rad = size * 0.34
+        lw = size * 0.1
+        head = 35  # degrees: where the arrowhead sits (upper right)
+        _arc_band(surf, color, (cx, cy), rad, head + 12, head + 300, lw)
+        th = math.radians(head)
+        px, py = cx + rad * math.cos(th), cy - rad * math.sin(th)
+        tx, ty = math.sin(th), math.cos(th)    # clockwise along the ring
+        nx, ny = math.cos(th), -math.sin(th)   # outwards
+        hl, hw = size * 0.2, size * 0.17
+        pygame.draw.polygon(surf, color, [
+            (px + tx * hl * 0.55, py + ty * hl * 0.55),
+            (px - tx * hl * 0.45 + nx * hw, py - ty * hl * 0.45 + ny * hw),
+            (px - tx * hl * 0.45 - nx * hw, py - ty * hl * 0.45 - ny * hw),
+        ])
     elif kind == "gear":
         radius = size * 0.28
         for k in range(8):
@@ -2492,10 +2545,10 @@ def draw_icon(surf, kind: str, center, size: int, color):
         pts = [(-a, -b), (a, -b), (a, -a), (b, -a), (b, a), (a, a), (a, b), (-a, b), (-a, a), (-b, a), (-b, -a), (-a, -a)]
         pygame.draw.polygon(surf, color, [P(x, y) for x, y in pts], w)
     elif kind == "power":
-        r = pygame.Rect(0, 0, int(size * 0.76), int(size * 0.76))
-        r.center = (cx, cy + int(size * 0.04))
-        pygame.draw.arc(surf, color, r, math.radians(120), math.radians(420), w)
-        pygame.draw.line(surf, color, P(0, -0.5), P(0, -0.04), w)
+        # The power symbol: a ring open at the top, and a stem through the gap
+        lw = size * 0.1
+        _arc_band(surf, color, (cx, cy + size * 0.04), size * 0.36, 125, 415, lw)
+        _round_line(surf, color, (cx, cy - size * 0.44), (cx, cy - size * 0.02), lw)
     elif kind == "globe":
         radius = int(size * 0.42)
         pygame.draw.circle(surf, color, (cx, cy), radius, w)
