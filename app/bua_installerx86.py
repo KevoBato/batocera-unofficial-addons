@@ -611,6 +611,9 @@ UNINSTALL: Dict[str, str] = {}
 # Logos named in the app list ("logo": image URL), for add-ons whose
 # installer and files live outside this repo
 LOGO_URLS: Dict[str, str] = {}
+# Heroes named in the app list ("hero": image URL): the larger picture shown
+# in the home screen's banner and the library's details panel
+HERO_URLS: Dict[str, str] = {}
 
 
 def load_app_tables():
@@ -626,6 +629,9 @@ def load_app_tables():
     LOGO_URLS.clear()
     LOGO_URLS.update({e["name"]: e["logo"] for e in data.get("apps", [])
                       if isinstance(e, dict) and e.get("name") and e.get("logo")})
+    HERO_URLS.clear()
+    HERO_URLS.update({e["name"]: e["hero"] for e in data.get("apps", [])
+                      if isinstance(e, dict) and e.get("name") and e.get("hero")})
     CHANGELOG = str(data.get("changelog", "")).strip()
 
 def get_top_level() -> List[Tuple[str, str]]:
@@ -2070,7 +2076,10 @@ LOGO_RULES = 2
 # (the repo listing among them) for up to 6 hours.
 LOGO_MISS_MAX_AGE = 6 * 3600
 # Images that are not logos: key maps, controller pictures, backgrounds
-LOGO_SKIP = re.compile(r"(key|joy|acima|abaixo|direita|esquerda|button|screenshot|controller|wallpaper|background|splash)", re.I)
+LOGO_SKIP = re.compile(r"(key|joy|acima|abaixo|direita|esquerda|button|screenshot|controller|wallpaper|background|splash|(?<![a-z])hero(?![a-z]))", re.I)
+# "hero" as a word of its own in a file name: celeste-hero.jpg, hero.png;
+# not clonehero.png or heroic-logo.png
+HERO_WORD = re.compile(r"(?<![a-z])hero(?![a-z])", re.I)
 
 _logo_lock = threading.Lock()
 _logo_index: Dict[str, str] = {}      # app -> logo file, or "" when none was found
@@ -2264,6 +2273,50 @@ def _download_logo(url: str) -> str:
     return path
 
 
+HERO_PREFIX = "hero:"  # heroes share the logo index and worker under this key
+
+
+def _repo_hero_url(app: str) -> str | None:
+    """An image with "hero" in its name in the app's folder (/extra first).
+    In a folder several apps share, the name must also match the app's."""
+    folder = _app_folder(app)
+    if not folder:
+        return None
+    shared = sum(1 for k in APPS if _app_folder(k) == folder) > 1
+    best, best_score = None, 0
+    for path in _repo_images():
+        if not path.startswith(folder + "/"):
+            continue
+        name = path.rsplit("/", 1)[-1]
+        if not HERO_WORD.search(name):
+            continue
+        named = _image_named(HERO_WORD.sub("", name), app)
+        if shared and not named:
+            continue
+        score = 1 + 4 * named + ("/extra/" in path)
+        if score > best_score:
+            best, best_score = path, score
+    return f"{BUA_BASE_URL}/{urllib.parse.quote(best)}" if best else None
+
+
+def _find_hero(app: str) -> str:
+    """Download the app's hero and return its file, or "" when it has none.
+    Like _find_logo, a failed download raises so it is tried again later."""
+    failed = None
+    for url in (HERO_URLS.get(app), _repo_hero_url(app)):
+        if not url:
+            continue
+        try:
+            path = _download_logo(url)
+        except urllib.error.HTTPError as e:
+            path, failed = "", e
+        if path:
+            return path
+    if failed is not None:
+        raise failed
+    return ""
+
+
 def _find_logo(app: str) -> str:
     """Download the app's logo and return its file, or "" when there is none.
     A logo the app list or installer names that turns out missing or not an
@@ -2296,7 +2349,10 @@ def _logo_worker():
         if app is None:
             return
         try:
-            path = _find_logo(app)
+            if app.startswith(HERO_PREFIX):
+                path = _find_hero(app[len(HERO_PREFIX):])
+            else:
+                path = _find_logo(app)
         except Exception as e:
             # Probably offline: guess again next time BUA starts
             print(f"[BUA] No logo for {app} yet: {e}")
@@ -2310,22 +2366,54 @@ def _logo_worker():
         _save_logo_index()
 
 
-def app_logo(app: str, box: Tuple[int, int]):
-    """The app's logo scaled to fit a box (w, h), or None while it is
-    unknown, downloading, or missing."""
+def _art_file(key: str) -> str | None:
+    """The downloaded file for a logo (key: app) or hero (key: hero:app),
+    asking the worker for it the first time; None until it is known, ""
+    when there is none."""
     global _logo_thread
     if not _logo_loaded:
         _load_logo_index()
-    path = _logo_index.get(app)
-    if path is None:
-        if app not in _logo_requested:
-            _logo_requested.add(app)
-            with _logo_lock:
-                _logo_pending.append(app)
-            if _logo_thread is None or not _logo_thread.is_alive():
-                _logo_thread = threading.Thread(target=_logo_worker, daemon=True)
-                _logo_thread.start()
+    path = _logo_index.get(key)
+    if path is None and key not in _logo_requested:
+        _logo_requested.add(key)
+        with _logo_lock:
+            _logo_pending.append(key)
+        if _logo_thread is None or not _logo_thread.is_alive():
+            _logo_thread = threading.Thread(target=_logo_worker, daemon=True)
+            _logo_thread.start()
+    return path
+
+
+def app_hero(app: str, size: Tuple[int, int], radius: int = 0):
+    """The app's hero cropped to cover a box (w, h), with rounded corners,
+    or None while it is unknown, downloading, or missing."""
+    path = _art_file(HERO_PREFIX + app)
+    if not path:
         return None
+    key = (HERO_PREFIX + app, size, radius)
+    if key not in _logo_surfaces:
+        try:
+            img = pygame.image.load(path).convert_alpha()
+            w, h = size
+            scale = max(w / img.get_width(), h / img.get_height())
+            img = pygame.transform.smoothscale(img, (max(w, int(img.get_width() * scale) + 1),
+                                                     max(h, int(img.get_height() * scale) + 1)))
+            cover = pygame.Surface((w, h), pygame.SRCALPHA)
+            cover.blit(img, ((w - img.get_width()) // 2, (h - img.get_height()) // 2))
+            if radius:
+                mask = pygame.Surface((w, h), pygame.SRCALPHA)
+                pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=radius)
+                cover.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+            _logo_surfaces[key] = cover
+        except Exception:
+            _logo_surfaces[key] = None
+    return _logo_surfaces[key]
+
+
+def app_logo(app: str, box: Tuple[int, int]):
+    """The app's logo scaled to fit a box (w, h), or None while it is
+    unknown, downloading, or missing."""
+    path = _art_file(app)
     if not path:
         return None
     key = (app, box)
@@ -3475,6 +3563,29 @@ def draw_addon_logo(rect, key: str, mono_font):
         draw_monogram(screen, mono, key, mono_font)
 
 
+_FADE_CACHE: Dict[tuple, pygame.Surface] = {}
+
+
+def hero_fade(size: Tuple[int, int], radius: int) -> pygame.Surface:
+    """A left-to-right fade in the background color: nearly solid behind the
+    text on the left, lighter on the right so the hero shows."""
+    key = (size, radius, tuple(BG))
+    fade = _FADE_CACHE.get(key)
+    if fade is None:
+        w, h = size
+        fade = pygame.Surface((w, h), pygame.SRCALPHA)
+        for x in range(w):
+            f = x / max(1, w - 1)
+            alpha = int(242 - 150 * min(1.0, max(0.0, (f - 0.15) / 0.75)))
+            pygame.draw.line(fade, (*BG, alpha), (x, 0), (x, h))
+        if radius:
+            mask = pygame.Surface((w, h), pygame.SRCALPHA)
+            pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=radius)
+            fade.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+        _FADE_CACHE[key] = fade
+    return fade
+
+
 class DashboardScreen(MenuScreen):
     """Home screen, console style: category tabs (LB/RB), the focused add-on
     in a large banner with its actions (A install, X queue, Y details), and
@@ -3805,7 +3916,17 @@ class DashboardScreen(MenuScreen):
             draw_action_button(pygame.Rect(tx0, by, action_button_width(label, "button", bh), bh), "A", label, True,
                                font_key="button")
         else:
-            draw_addon_logo(box, key, f["monogram_big"])
+            hero_img = app_hero(key, hero.size, S(24))
+            if hero_img is not None:
+                screen.blit(hero_img, hero.topleft)
+                screen.blit(hero_fade(hero.size, S(24)), hero.topleft)
+                logo = app_logo(key, (int(box.w * 0.9), int(box.h * 0.9)))
+                if logo is not None:
+                    screen.blit(logo, logo.get_rect(center=box.center))
+                else:
+                    draw_addon_logo(box, key, f["monogram_big"])
+            else:
+                draw_addon_logo(box, key, f["monogram_big"])
             y = box.y + S(4)
             kicker = f["small"].render(cat_label.upper(), True, ACCENT)
             screen.blit(kicker, (tx0, y))
@@ -4127,7 +4248,11 @@ class LibraryScreen(BaseScreen):
         py = S(28)
         if key:
             box = pygame.Rect(px, py, pw, S(180))
-            draw_addon_logo(box, key, f["monogram_big"])
+            hero_img = app_hero(key, box.size, max(6, box.h // 6))
+            if hero_img is not None:
+                screen.blit(hero_img, box.topleft)
+            else:
+                draw_addon_logo(box, key, f["monogram_big"])
             py = box.bottom + S(20)
             kicker = f["small"].render(labels.get(self.category(), self.category()).upper(), True, ACCENT)
             screen.blit(kicker, (px, py))
