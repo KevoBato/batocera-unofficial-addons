@@ -3681,12 +3681,27 @@ class DashboardScreen(MenuScreen):
         rb_w = draw_button_glyph(pygame.Surface((1, 1), pygame.SRCALPHA), "RB", (0, 0), glyph_h)
         tab_h = S(40)
         avail = (W - 2 * m) - lb_w - rb_w - S(16)
+        # Each tab is as wide as its label in the selected tab's bold font,
+        # whichever tab is selected, so the row never changes width as the
+        # selection moves. If six such tabs don't fit, a smaller bold is used.
+        totals = [stats.get(c, (0, len(CATEGORIES.get(c, []))))[1] for c, _l in tabs]
+
+        def slot(label: str, total: int, bold: str) -> int:
+            name_w = max(f[bold].size(label)[0], f["body"].size(label)[0])
+            return name_w + S(6) + f["small"].size(str(total))[0] + S(26)
+
+        gaps = S(6) * (len(tabs) - 1)
+        bold = "button"
+        for candidate in ("tile", "button"):
+            if sum(slot(l, n, candidate) for (_c, l), n in zip(tabs, totals)) + gaps <= avail:
+                bold = candidate
+                break
         labels = []
         for i, (c, label) in enumerate(tabs):
-            total = stats.get(c, (0, len(CATEGORIES.get(c, []))))[1]
-            name_img = f["tile" if i == self.tab else "body"].render(label, True, ON_ACCENT if i == self.tab else TEXT_SOFT)
-            count_img = f["small"].render(str(total), True, ON_ACCENT if i == self.tab else MUTED)
-            labels.append((name_img, count_img, name_img.get_width() + S(6) + count_img.get_width() + S(26)))
+            on = i == self.tab
+            name_img = f[bold if on else "body"].render(label, True, ON_ACCENT if on else TEXT_SOFT)
+            count_img = f["small"].render(str(totals[i]), True, ON_ACCENT if on else MUTED)
+            labels.append((name_img, count_img, slot(label, totals[i], bold)))
         start, end = 0, len(tabs)
         while sum(w for _n, _c, w in labels[start:end]) + S(6) * (end - start - 1) > avail and end - start > 1:
             if self.tab - start > end - 1 - self.tab:
@@ -3703,8 +3718,9 @@ class DashboardScreen(MenuScreen):
                 pygame.draw.rect(screen, ACCENT, rect, border_radius=tab_h // 2)
                 if self.zone == "tabs":
                     pygame.draw.rect(screen, FG, rect.inflate(S(8), S(8)), width=max(2, S(2)), border_radius=tab_h // 2 + S(4))
-            screen.blit(name_img, (rect.x + S(13), rect.centery - name_img.get_height() // 2))
-            screen.blit(count_img, (rect.x + S(13) + name_img.get_width() + S(6), rect.centery - count_img.get_height() // 2 + S(1)))
+            content_x = rect.x + (w - name_img.get_width() - S(6) - count_img.get_width()) // 2
+            screen.blit(name_img, (content_x, rect.centery - name_img.get_height() // 2))
+            screen.blit(count_img, (content_x + name_img.get_width() + S(6), rect.centery - count_img.get_height() // 2 + S(1)))
             tx += w + S(6)
         draw_button_glyph(screen, "RB", (tx + S(2) + rb_w // 2, cy), glyph_h)
 
