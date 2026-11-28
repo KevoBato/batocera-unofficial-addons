@@ -810,6 +810,7 @@ def load_console_fonts():
     return {
         "hero": sys_font(30, bold=True),
         "display": sys_font(42, bold=True),
+        "button": sys_font(16, bold=True),
         "tile": sys_font(20, bold=True),
         "body": sys_font(17),
         "small": sys_font(14),
@@ -3372,12 +3373,12 @@ def draw_toast_at(message: str, topright):
     screen.blit(img, img.get_rect(center=chip.center))
 
 
-def draw_action_button(rect, key: str, label: str, primary: bool, centered: bool = False):
+def draw_action_button(rect, key: str, label: str, primary: bool, centered: bool = False, font_key: str = "tile"):
     """An action button: the controller button, then its label."""
     f = UI_FONTS
-    text = f["tile"].render(label, True, ON_ACCENT if primary else FG)
+    text = f[font_key].render(label, True, ON_ACCENT if primary else FG)
     h = rect.h
-    glyph = h - S(16)
+    glyph = h - S(14) if font_key != "tile" else h - S(16)
     if primary:
         pygame.draw.rect(screen, ACCENT, rect, border_radius=h // 2)
     else:
@@ -3389,8 +3390,10 @@ def draw_action_button(rect, key: str, label: str, primary: bool, centered: bool
     screen.blit(text, (x + glyph + S(12), rect.centery - text.get_height() // 2))
 
 
-def action_button_width(label: str) -> int:
-    return S(8) + (S(48) - S(16)) + S(12) + UI_FONTS["tile"].size(label)[0] + S(22)
+def action_button_width(label: str, font_key: str = "tile", h: int | None = None) -> int:
+    h = h or S(48)
+    glyph = h - S(14) if font_key != "tile" else h - S(16)
+    return S(8) + glyph + S(12) + UI_FONTS[font_key].size(label)[0] + S(20)
 
 
 def draw_addon_logo(rect, key: str, mono_font):
@@ -3703,7 +3706,7 @@ class DashboardScreen(MenuScreen):
         tx0 = box.right + S(36)
         text_w = hero.right - pad - tx0
         cat_label = dict(tabs).get(cat, cat)
-        bh = S(48)
+        bh = S(38)
         by = box.bottom - bh
         if key is None:
             pygame.draw.rect(screen, LOGO_PANEL, box, border_radius=S(20))
@@ -3717,7 +3720,8 @@ class DashboardScreen(MenuScreen):
             draw_text(screen, fit_text(t("dash_view_all_desc").format(category=cat_label), f["body"], text_w),
                       f["body"], TEXT_SOFT, (tx0, y))
             label = t("dash_view_all")
-            draw_action_button(pygame.Rect(tx0, by, action_button_width(label), bh), "A", label, True)
+            draw_action_button(pygame.Rect(tx0, by, action_button_width(label, "button", bh), bh), "A", label, True,
+                               font_key="button")
         else:
             draw_addon_logo(box, key, f["monogram_big"])
             y = box.y + S(4)
@@ -3741,9 +3745,9 @@ class DashboardScreen(MenuScreen):
             for k, label, primary in (("A", t("dash_reinstall") if installed else t("dash_install"), True),
                                       ("X", t("dash_remove_queue") if is_queued else t("dash_add_queue"), False),
                                       ("Y", t("dash_details"), False)):
-                w = action_button_width(label)
-                draw_action_button(pygame.Rect(bx, by, w, bh), k, label, primary)
-                bx += w + S(12)
+                w = action_button_width(label, "button", bh)
+                draw_action_button(pygame.Rect(bx, by, w, bh), k, label, primary, font_key="button")
+                bx += w + S(10)
 
         # The category's add-ons in a row, then View all
         row_top = hero.bottom + S(24)
